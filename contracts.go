@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	git "github.com/abxengg/codist-git"
+	java "github.com/abxengg/codist-java"
 )
 
 // A change is often wrong only against what the code around it promises: a method whose javadoc says the total
@@ -158,4 +159,27 @@ func rulesSection(rules string) string {
 	}
 	return "\n## This team's rules\nThe team wrote these rules for this code. A change that breaks one is a bug even when " +
 		"the code runs; name the rule you rely on.\n" + rules + "\n"
+}
+
+// code is the main Java code at one commit with its index and call graph.
+type code struct {
+	sources map[string][]byte
+	ix      *java.Index
+	calls   []java.MethodCall
+}
+
+func (r *Reviewer) codeAt(sha string) *code {
+	files, err := r.Repo.Files(sha)
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	for _, f := range files {
+		if strings.HasSuffix(f, ".java") && !strings.Contains(f, "/src/test/") && (r.Ignored == nil || !r.Ignored(f)) {
+			paths = append(paths, f)
+		}
+	}
+	sources := r.Repo.ReadAll(sha, paths)
+	ix := java.Build(sources, nil)
+	return &code{sources, ix, java.BuildCallGraph(sources, ix.Types).Calls()}
 }

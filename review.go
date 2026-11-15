@@ -23,11 +23,12 @@ import (
 
 // Reviewer reviews commits of one repository.
 type Reviewer struct {
-	Repo     *git.Repo
-	Store    *store.Store
-	Model    *model.Client // nil means rules only
+	Repo  *git.Repo
+	Store *store.Store
+	Model *model.Client // nil means rules only
+	// MaxFiles is how many changed files of a commit the model reads without planning. Above it the model first
+	// decides which files need reading (see plan); every file is still considered and the decision is stored.
 	MaxFiles int
-	Callers  bool // show the model the code in other files that calls the changed methods
 	Learn    bool // show the model findings this team marked wrong or useful, as examples
 	// Contracts shows the model the signature and javadoc of the methods the changed code calls in other files.
 	Contracts bool
@@ -36,7 +37,10 @@ type Reviewer struct {
 	Ignored func(path string) bool
 	// Languages are the languages reviewed; empty means Java only. See Language.
 	Languages []Language
-	head      string // HEAD while one review runs, so it is asked of git once and not for every file
+	head      string      // HEAD while one review runs, so it is asked of git once and not for every file
+	docs      []paragraph // the project's documents at the commit under review, read when a check first needs them
+	reading   string      // which reading of a file the model is on, for the trail
+	trail     *Trail      // what happened in the model review under way; nil when the model is not asked
 	// NoSecondLook turns off the model's second look at each serious finding it made (see secondLook). It is on
 	// unless turned off: on the planted-bug test it turned false alarms on clean commits into notes.
 	NoSecondLook bool
@@ -44,8 +48,17 @@ type Reviewer struct {
 
 // Options says how much of a review to do.
 type Options struct {
-	RulesOnly bool   // skip the model, for catching up on older commits
-	Why       string // why the model was skipped, shown with the review
+	RulesOnly bool // skip the model, for catching up on older commits
+	// Twice has the model read each file a second time and adds what only the second reading reports. Every finding
+	// still passes the same checks. For commits likely to bring a bug: it costs one more model call per file.
+	Twice bool
+	// Deep has the model read each file once more through each of the Lenses, a specialist's question at a time,
+	// and adds what only those readings report. It costs a model call per file and lens, so it is for when the
+	// machine has nothing else to read. The first reading comes from the cache when the commit was read before.
+	Deep bool
+	// Force lists files a person asked the model to read although the plan skipped them.
+	Force []string
+	Why   string // why the model was skipped, shown with the review
 }
 
 // ErrModelFailed is returned by Review when the model was asked about a commit's files and every call failed, as
@@ -56,13 +69,13 @@ var ErrModelFailed = errors.New("the model could not read this commit")
 // Review reviews one commit and stores the result. Code check findings are saved first, so they
 // show while the model is still working.
 func (r *Reviewer) Review(ctx context.Context, sha string, opt Options) error {
-	c, err := r.Repo.Get(sha) // always store under the full id, whatever form it was given in
+	c, changes, err := r.Repo.Show(sha) // the commit and its changes in one git call
 	if err != nil {
 		return err
 	}
-	sha = c.SHA
-	r.head = r.Repo.Head()
-	defer func() { r.head = "" }()
+	sha = c.SHA // always store under the full id, whatever form it was given in
+	r.head, r.docs = r.Repo.Head(), nil
+	defer func() { r.head, r.docs = "", nil }()
 	started := time.Now()
 	modelName := ""
 	if r.Model != nil && !opt.RulesOnly {
@@ -74,10 +87,6 @@ func (r *Reviewer) Review(ctx context.Context, sha string, opt Options) error {
 		warnIf(r.Store.SetReview(store.Review{SHA: sha, Status: "failed", Model: modelName, Note: err.Error(), Started: started, Finished: time.Now()}),
 			"review status not saved", "sha", c.Short)
 		return err
-	}
-	changes, err := r.Repo.Changes(sha)
-	if err != nil {
-		return fail(err)
 	}
 	for i := range changes {
 		changes[i].Added = withDeletions(changes[i].Added, changes[i].Patch)
@@ -106,9 +115,20 @@ func (r *Reviewer) Review(ctx context.Context, sha string, opt Options) error {
 		for _, is := range lang.Check(f, changed, r.facts(lang)) {
 			findings = append(findings, finding(sha, c.Path, f, is.Line, is.End, is.Severity, "rule", is.Rule, is.Title, is.Detail, is.Suggestion, ""))
 		}
+		if !lang.IsTest(c.Path) {
+			findings = append(findings, r.specNumbers(sha, c, f)...)
+		}
 		targets = append(targets, target{c, f})
 	}
-	stats := Stats{PromptVersion: PromptVersion, Model: modelName}
+	findings = append(findings, r.ranFindings(c, changes, func(ch git.FileChange) Parsed {
+		for _, t := range targets {
+			if t.change.Path == ch.Path {
+				return t.file
+			}
+		}
+		return nil
+	})...)
+	stats := Stats{PromptVersion: PromptVersion, Model: modelName, Deep: opt.Deep}
 	logger().Debug("checks done", "sha", c.Short, "changed", len(changes), "reviewed", len(targets), "rule_findings", len(findings))
 	findings = r.hideWrong(findings, &stats)
 	if err := r.Store.ReplaceFindings(sha, findings); err != nil {
@@ -120,6 +140,8 @@ func (r *Reviewer) Review(ctx context.Context, sha string, opt Options) error {
 		notes = append(notes, opt.Why)
 	}
 	if r.Model != nil && !opt.RulesOnly {
+		r.trail = &Trail{Files: []TrailFile{}, Discarded: []Discarded{}, Steps: map[string][]TrailStep{}}
+		defer func() { r.trail.save(r.Store, sha); r.trail = nil }()
 		commit := c
 		var related map[string]string
 		learned := ""
@@ -127,61 +149,98 @@ func (r *Reviewer) Review(ctx context.Context, sha string, opt Options) error {
 			learned = r.feedbackExamples()
 		}
 		related = map[string]string{}
-		if r.Callers || r.Contracts {
+		if r.Contracts {
 			var changed []git.FileChange
 			for _, t := range targets {
 				changed = append(changed, t.change)
 			}
-			cd := r.codeAt(sha)
-			if r.Callers {
-				for p, v := range r.callerContext(cd, changed) {
-					related[p] += v
-				}
-			}
-			if r.Contracts {
-				for p, v := range r.contractContext(cd, changed) {
-					related[p] += v
-				}
-			}
+			related = r.contractContext(r.codeAt(sha), changed)
 		}
 		system := systemPrompt + rulesSection(r.Rules) + learned // the same for every file, so it goes first
 		var triage *Triage
 		if r.Learn {
 			triage = r.triageFromFeedback()
 		}
-		reviewed, failures := 0, 0
+		// Every file is read first and every second look comes after: the model server keeps its work on the opening
+		// part of a prompt only while the next prompt starts the same, and the two kinds of call start differently.
+		type read struct {
+			t      target
+			others []git.FileChange
+			got    []store.Finding
+		}
+		var reads []read
+		shown := r.ranAt(sha) // what running the code showed, when it has been run
+		var files []planned
 		for _, t := range targets {
+			files = append(files, planned{t.change, t.file})
+		}
+		plan := r.plan(ctx, commit, files, opt.Force, &stats)
+		warnIf(r.Store.SetPlan(sha, plan), "reading plan not saved", "sha", c.Short)
+		reviewed, failures := 0, 0
+		for i, t := range targets {
 			if ctx.Err() != nil {
 				return fail(ctx.Err())
 			}
-			if l := r.langOf(t.change.Path); l != nil && l.IsTest(t.change.Path) || len(t.change.Added) == 0 {
+			if plan[i].Decision != "read" {
 				continue
-			}
-			if reviewed >= r.MaxFiles {
-				notes = append(notes, fmt.Sprintf("The model reviewed the first %d changed files; checks covered all of them.", r.MaxFiles))
-				break
 			}
 			reviewed++
 			fileStart := time.Now()
 			others := otherChanges(changes, t.change.Path)
-			got, dropped, err := r.modelReview(ctx, commit, t.change, t.file, findings, system, related[t.change.Path]+othersSection(others), &stats)
+			extra := related[t.change.Path] + othersSection(others) + r.ranSection(shown, t.change.Path)
+			r.reading = "first"
+			got, dropped, err := r.modelReview(ctx, commit, t.change, t.file, findings, system, extra, &stats)
 			if err != nil {
+				r.trail.file(TrailFile{Path: t.change.Path, Reading: "first", Error: err.Error()})
 				logger().Warn("model could not review file", "sha", c.Short, "path", t.change.Path, "err", err)
 				notes = append(notes, "The model could not review "+t.change.Path+": "+err.Error())
 				failures++
 				continue
+			}
+			var readings []string
+			if opt.Twice {
+				readings = append(readings, secondReading)
+			}
+			if opt.Deep {
+				readings = append(readings, Lenses...)
+			}
+			for _, reading := range readings {
+				r.reading = readingName(reading)
+				if again, _, err := r.modelReview(ctx, commit, t.change, t.file, findings, system, extra+reading, &stats); err == nil {
+					got = addNew(got, again)
+				}
 			}
 			logger().Debug("model reviewed file", "sha", c.Short, "path", t.change.Path, "kept", len(got), "dropped", dropped,
 				"took", time.Since(fileStart).Round(time.Millisecond))
 			if dropped > 0 {
 				logger().Info("dropped model findings", "sha", c.Short, "path", t.change.Path, "count", dropped)
 			}
-			got = r.contradict(sha, t.change, t.file, others, got) // exact facts first; a contradicted claim skips the second look
+			// exact facts first; a contradicted claim skips the second look
+			reads = append(reads, read{t, others, r.contradict(sha, t.change, t.file, others, got)})
+		}
+		for _, rd := range reads {
+			if ctx.Err() != nil {
+				return fail(ctx.Err())
+			}
+			got := rd.got
 			if !r.NoSecondLook {
-				got = r.secondLook(ctx, commit, t.change, t.file.Lines(), got, &stats)
+				got = r.secondLook(ctx, commit, rd.t.change, rd.t.file.Lines(), got, &stats)
 			}
 			for i := range got {
+				was := got[i].Doubt
 				got[i] = triage.demote(got[i])
+				if got[i].Doubt != was {
+					r.trail.step(got[i].Key, "learned filter", "demoted", "%s", got[i].Doubt)
+				}
+				// What the model itself rates minor gets no second look, so it is not shown as checked: on the test
+				// projects no real bug was rated this low, and the false alarms were.
+				if got[i].Doubt == "" && (got[i].Severity == "low" || got[i].Severity == "info") {
+					got[i].Doubt = "The model rated this minor, so Codist did not check it further."
+					r.trail.step(got[i].Key, "severity", "note", "The model rated it %s.", got[i].Severity)
+				}
+				if got[i].Doubt == "" {
+					r.trail.step(got[i].Key, "result", "kept", "Shown as an issue.")
+				}
 			}
 			findings = append(findings, r.hideWrong(got, &stats)...)
 			warnIf(r.Store.ReplaceFindings(sha, findings), "progress not saved", "sha", c.Short) // show progress file by file
@@ -194,6 +253,17 @@ func (r *Reviewer) Review(ctx context.Context, sha string, opt Options) error {
 			return ErrModelFailed
 		}
 	}
+	// A run that finished while the model was reading added its findings to the store; saving the review's own list
+	// took them out again. Put back what the run shows now.
+	late := r.ranFindings(c, changes, func(ch git.FileChange) Parsed {
+		for _, t := range targets {
+			if t.change.Path == ch.Path {
+				return t.file
+			}
+		}
+		return nil
+	})
+	warnIf(r.Store.AddFindings(sha, late), "run findings not saved", "sha", c.Short)
 	r.resolve(sha, changes)
 	r.settle(sha, findings)
 	if stats.Hidden > 0 {
@@ -206,6 +276,59 @@ func (r *Reviewer) Review(ctx context.Context, sha string, opt Options) error {
 	}
 	logger().Debug("review done", "sha", c.Short, "findings", len(findings), "hidden", stats.Hidden, "took", time.Since(started).Round(time.Millisecond))
 	return r.Store.SetReview(store.Review{SHA: sha, Status: "done", Model: modelName, Note: strings.Join(notes, " "), Started: started, Finished: time.Now()})
+}
+
+// secondReading ends the prompt of a second reading. It comes last, so the model server reuses its work on
+// everything before it, and it asks for another order of reading so the reply is not the first one again.
+const secondReading = "\n## Second reading\nYou have read this change once. Read it again from the last changed line to the first, " +
+	"and report what a first reading would miss: a wrong value, a missing case, a condition turned around.\n"
+
+// readingName names a reading for the trail.
+func readingName(extra string) string {
+	if extra == secondReading {
+		return "second"
+	}
+	if i := strings.Index(extra, "## Read as a specialist in "); i >= 0 {
+		rest := extra[i+len("## Read as a specialist in "):]
+		return "specialist in " + rest[:strings.Index(rest, "\n")]
+	}
+	return "first"
+}
+
+// Lenses are the specialist readings of a deep pass. Each ends the prompt, so the model server reuses its work on
+// everything before it. One generalist reading misses what a reviewer with one question in mind sees.
+var Lenses = []string{
+	"\n## Read as a specialist in failures\nRead this change again with one question only: what happens when something goes wrong here? " +
+		"A value that is null, empty, zero or negative; an exception that is swallowed, or thrown where it was not before; a resource left open; " +
+		"a loop that runs once too often or not at all. Report only what the first reading would miss.\n",
+	"\n## Read as a specialist in this team's rules\nRead this change again with one question only: does it keep every rule and document of this team " +
+		"that speaks about this code? Go through the rules one by one. Check each number, limit, unit and order of steps the rules state against " +
+		"the code after the commit. Report only what the first reading would miss, and name the rule.\n",
+}
+
+// NextDeep picks what a model lane with nothing else to do reads next: the newest of the last limit commits that
+// the model has read but not yet read deeply, or "" when there is none. A commit whose review failed is left alone,
+// so one the model cannot take is not tried for ever.
+func NextDeep(st *store.Store, repo *git.Repo, limit int) string {
+	log, _ := repo.LogRef("HEAD", limit)
+	all, reviews := st.AllStats(), st.Reviews()
+	for _, c := range log {
+		var s Stats
+		if raw, ok := all[c.SHA]; ok && json.Unmarshal(raw, &s) == nil && !s.Deep && s.Calls+s.Cached > 0 && reviews[c.SHA].Status == "done" {
+			return c.SHA
+		}
+	}
+	return ""
+}
+
+// addNew adds to a file's findings those of a second reading that are not near one already there.
+func addNew(got, again []store.Finding) []store.Finding {
+	for _, a := range again {
+		if !slices.ContainsFunc(got, func(g store.Finding) bool { return a.Line >= g.Line-2 && a.Line <= g.EndLine+2 }) {
+			got = append(got, a)
+		}
+	}
+	return got
 }
 
 // finding builds a stored finding with the key that identifies the same issue in later commits:
@@ -228,6 +351,14 @@ func finding(sha, path string, f Parsed, line, end int, severity, source, rule, 
 var space = regexp.MustCompile(`\s+`)
 
 func squash(s string) string { return space.ReplaceAllString(s, "") }
+
+// sameMarks is code as the model's quotes are compared with it: without spacing and without quotation marks. A model
+// writing JSON is told to type ' where the code has ", because one unescaped " ends its text early and the rest of
+// the reply is lost. Some models then type ' in its place, and some leave the mark out: Qwen 3.5 quoted
+// FORMULA_STARTS = "=+@"; as FORMULA_STARTS = =+@;. Both have to match.
+func sameMarks(s string) string {
+	return strings.NewReplacer(`"`, "", "'", "", "`", "", `\`, "").Replace(squash(s))
+}
 
 // resolve closes open issues in the files a commit changed.
 func (r *Reviewer) resolve(sha string, changes []git.FileChange) {
@@ -291,7 +422,8 @@ func (r *Reviewer) settle(sha string, findings []store.Finding) {
 
 // gone lists which open issues of a file are no longer there in src, the file at sha (present false when it is not
 // there at all). A check issue is gone when the check, run on the whole file, no longer reports it. A model issue is
-// gone when the line it flagged is gone, since the model cannot be asked again for every commit.
+// gone when the line it flagged is gone, since the model cannot be asked again for every commit; so is a changed
+// number that a document disagrees with.
 func (r *Reviewer) gone(sha, path string, src []byte, present bool, open []store.OpenIssue) []string {
 	var text string
 	still := map[string]bool{}
@@ -308,7 +440,8 @@ func (r *Reviewer) gone(sha, path string, src []byte, present bool, open []store
 	}
 	var fixed []string
 	for _, o := range open {
-		if o.Rule != "" && !still[o.Key] || o.Rule == "" && squash(o.Snippet) != "" && !strings.Contains(text, squash(o.Snippet)) {
+		byLine := o.Rule == "" || o.Rule == specRule || o.Rule == ranRule // no whole-file check reports these again
+		if !byLine && !still[o.Key] || byLine && squash(o.Snippet) != "" && !strings.Contains(text, squash(o.Snippet)) {
 			fixed = append(fixed, o.Key)
 		}
 	}

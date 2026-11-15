@@ -30,6 +30,7 @@ type Stats struct {
 	DecodeSeconds  float64 `json:"decodeSeconds"`  // writing replies
 	Hidden         int     `json:"hidden"`         // findings not shown because a person marked them wrong
 	Refuted        int     `json:"refuted"`        // serious findings a second look could not confirm, kept as notes
+	Deep           bool    `json:"deep,omitempty"` // read through each specialist lens as well, in idle time
 }
 
 func (s *Stats) add(u model.Usage) {

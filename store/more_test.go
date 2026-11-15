@@ -187,3 +187,28 @@ func TestOpenRepoNamesByPathAndMovesOldData(t *testing.T) {
 		t.Fatal("the old file should have moved")
 	}
 }
+
+func TestOutcomes(t *testing.T) {
+	s, err := Open(t.TempDir(), "r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.SetReview(Review{SHA: "c1", Status: "done"})
+	f := func(key, rule string) Finding {
+		return Finding{SHA: "c1", Path: "A.java", Line: 1, Severity: "high", Source: "rule", Rule: rule, Title: key, Key: key}
+	}
+	if err := s.ReplaceFindings("c1", []Finding{f("k1", "empty-catch"), f("k2", "empty-catch"), f("k3", "empty-catch"), f("k4", ""), f("k5", ""), f("k6", "system-out")}); err != nil {
+		t.Fatal(err)
+	}
+	s.Resolve([]string{"k1"}, "c2")
+	s.SetIssueState("k2", "resolved")
+	s.SetFeedback("k4", "wrong", "")
+	s.SetFeedback("k5", "useful", "")
+	got := s.Outcomes()
+	if len(got) != 3 || got[0] != (Outcome{Source: "empty-catch", Found: 3, Fixed: 1, ByHand: 1, Open: 1, ActedOn: 1}) ||
+		got[1] != (Outcome{Source: "model", Found: 2, Open: 1, Useful: 1, Wrong: 1, ActedOn: 0.5}) ||
+		got[2] != (Outcome{Source: "system-out", Found: 1, Open: 1, ActedOn: -1}) {
+		t.Errorf("%+v", got)
+	}
+}

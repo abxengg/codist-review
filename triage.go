@@ -101,16 +101,17 @@ func (t *Triage) demote(f store.Finding) store.Finding {
 	return f
 }
 
-// triageFromFeedback trains on the model findings this repository's team has judged.
+// triageFromFeedback trains on the model findings whose outcome is known in this repository: those the team marked
+// useful or wrong, and those a later commit fixed, which is a team acting on a finding without clicking anything.
 func (r *Reviewer) triageFromFeedback() *Triage {
 	feedback := r.Store.AllFeedback()
-	if len(feedback) < triageMinLabels {
-		return nil
-	}
 	var ex []TriageExample
 	for _, is := range r.Store.AllIssues() {
-		if fb, ok := feedback[is.Key]; ok && (fb.Verdict == "useful" || fb.Verdict == "wrong") {
-			ex = append(ex, TriageExample{Finding: is.Latest, Useful: fb.Verdict == "useful"})
+		switch v := feedback[is.Key].Verdict; {
+		case v == "useful" || v == "wrong":
+			ex = append(ex, TriageExample{Finding: is.Latest, Useful: v == "useful"})
+		case is.State == "resolved":
+			ex = append(ex, TriageExample{Finding: is.Latest, Useful: true})
 		}
 	}
 	return TrainTriage(ex)

@@ -186,3 +186,44 @@ func TestWithDeletions(t *testing.T) {
 		t.Fatalf("a replaced line: %v", got)
 	}
 }
+
+// A merge is reviewed on what was written by hand to settle it: here the person merging left an empty catch.
+func TestMergeIsReviewedOnItsHandWrittenPart(t *testing.T) {
+	tr, r, st := setup(t)
+	const p = "order-service/src/main/java/com/shop/order/Extra.java"
+	body := func(s string) string {
+		return "package com.shop.order;\n\npublic class Extra {\n    int f(int n) {\n" + s + "    }\n}\n"
+	}
+	tr.Commit("Add Extra", map[string]string{p: body("        return n;\n")})
+	tr.Git("checkout", "-q", "-b", "side")
+	tr.Commit("Side", map[string]string{p: body("        return n + 1;\n")})
+	tr.Git("checkout", "-q", "main")
+	tr.Commit("Main", map[string]string{p: body("        return n + 2;\n")})
+	if out, err := exec.Command("git", "-C", tr.Dir, "merge", "side").CombinedOutput(); err == nil {
+		t.Fatalf("expected a conflict: %s", out)
+	}
+	tr.Commit("Merge side", map[string]string{p: body("        try {\n            return n + 3;\n        } catch (Exception e) {\n        }\n        return 0;\n")})
+	if err := r.Review(context.Background(), tr.Head(), Options{RulesOnly: true}); err != nil {
+		t.Fatal(err)
+	}
+	fs := st.Findings(tr.Head())
+	if len(fs) != 1 || fs[0].Rule != "empty-catch" {
+		t.Errorf("%+v", fs)
+	}
+}
+
+// A quote with single quotes matches code with double quotes: models are told not to type a double quote.
+func TestQuotesMatchWhateverTheQuotationMark(t *testing.T) {
+	lines := []string{"class A {", `    if (key.equals("P")) {`, "    }", "}"}
+	if drop, _, _ := judge(lines, "", 2, "high", "Pause never works", "if (key.equals('P')) {"); drop != "" {
+		t.Errorf("a quote with single quotes was dropped: %s", drop)
+	}
+	if got := verdictOf("confirmed", "key.equals('P')", "", "It compares by value.", `if (key.equals("P")) {`); got != "confirmed" {
+		t.Errorf("second look quote: %s", got)
+	}
+	// A quote that leaves the marks out altogether matches too.
+	if got := verdictOf("confirmed", "private static final String FORMULA_STARTS = =+@;", "", "The hyphen was removed.",
+		`    private static final String FORMULA_STARTS = "=+@";`); got != "confirmed" {
+		t.Errorf("a quote without its marks: %s", got)
+	}
+}

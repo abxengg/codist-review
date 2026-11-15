@@ -168,3 +168,12 @@ func TestHelpers(t *testing.T) {
 		t.Error("words")
 	}
 }
+
+func TestReverted(t *testing.T) {
+	hist := []git.CommitStat{{SHA: "a", Subject: "Add cache"}, {SHA: "b", Subject: "Tidy"}, {SHA: "c", Subject: "Add cache"},
+		{SHA: "d", Subject: `Revert "Add cache"`}, {SHA: "e", Subject: `Revert "Revert "Add cache""`}, {SHA: "f", Subject: `Revert "Never there"`}}
+	got := Reverted(hist)
+	if len(got) != 1 || !got["c"] {
+		t.Errorf("the newest commit with the reverted subject, and only it: %v", got)
+	}
+}

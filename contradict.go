@@ -43,6 +43,7 @@ func (r *Reviewer) contradict(sha string, ch git.FileChange, f Parsed, others []
 		logger().Debug("model claim contradicted", "sha", sha[:min(7, len(sha))], "path", ch.Path, "line", fd.Line, "title", fd.Title, "why", why)
 		got[i].Doubt = why
 		got[i].Severity = "low"
+		r.trail.step(fd.Key, "exact check", "contradicted", "%s", why)
 	}
 	return got
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 
@@ -18,28 +19,38 @@ import (
 //go:embed review.md
 var systemPrompt string
 
+// text is a string field of a reply with a limit on its length. Without limits a model can write until the reply
+// is cut off, and a cut-off reply is not JSON: Qwen 3.5 did that on a third of its calls.
+func text(max int) map[string]any { return map[string]any{"type": "string", "maxLength": max} }
+
 // schema forces the model to return a quote and a line for every finding.
 var schema = map[string]any{
 	"type": "object",
 	"properties": map[string]any{
+		// Written before the findings (keys go out in alphabetical order): a small model judges a change better once
+		// it has said what the change is, who sees a different result, and what the rules say that result must be.
+		"change":   text(300),
+		"effect":   text(400),
+		"expected": text(500), // the rules outrank the commit message
 		"findings": map[string]any{
-			"type": "array",
+			"type":     "array",
+			"maxItems": 5,
 			"items": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"line":       map[string]any{"type": "integer"},
 					"endLine":    map[string]any{"type": "integer"},
 					"severity":   map[string]any{"type": "string", "enum": severities},
-					"title":      map[string]any{"type": "string"},
-					"evidence":   map[string]any{"type": "string"},
-					"detail":     map[string]any{"type": "string"},
-					"suggestion": map[string]any{"type": "string"},
+					"title":      text(120),
+					"evidence":   text(300),
+					"detail":     text(600),
+					"suggestion": text(400),
 				},
 				"required": []string{"line", "severity", "title", "evidence", "detail"},
 			},
 		},
 	},
-	"required": []string{"findings"},
+	"required": []string{"change", "effect", "expected", "findings"},
 }
 
 type modelFinding struct {
@@ -61,6 +72,9 @@ const maxWholeFile = 300
 // team's rules and judged examples), so the model server can reuse its work on that opening part between calls.
 func (r *Reviewer) modelReview(ctx context.Context, c git.Commit, ch git.FileChange, f Parsed, known []store.Finding, system, related string, st *Stats) ([]store.Finding, int, error) {
 	var out struct {
+		Change   string         `json:"change"`
+		Effect   string         `json:"effect"`
+		Expected string         `json:"expected"`
 		Findings []modelFinding `json:"findings"`
 	}
 	lang := "text"
@@ -82,16 +96,30 @@ func (r *Reviewer) modelReview(ctx context.Context, c git.Commit, ch git.FileCha
 			warnIf(r.Store.SetCachedReply(key, raw), "model reply not cached", "sha", c.Short, "path", ch.Path)
 		}
 	}
+	logger().Debug("model read the change", "sha", c.Short, "path", ch.Path, "change", out.Change, "effect", out.Effect, "expected", out.Expected)
+	r.trail.file(TrailFile{Path: ch.Path, Reading: cmp.Or(r.reading, "first"), Change: out.Change, Effect: out.Effect, Expected: out.Expected})
 	var got []store.Finding
 	dropped := 0
 	for _, m := range out.Findings {
 		drop, severity, doubt := judge(f.Lines(), ch.Patch, m.Line, strings.ToLower(m.Severity), m.Title, m.Evidence)
 		if drop != "" || repeatsRule(known, ch.Path, m.Line) {
+			r.trail.discard(ch.Path, m.Line, strings.TrimSpace(m.Title), cmp.Or(drop, "A code check already reports this line."))
 			logger().Debug("model finding dropped", "sha", c.Short, "path", ch.Path, "line", m.Line, "title", m.Title, "why", cmp.Or(drop, "a code check already reported it"))
 			dropped++
 			continue
 		}
-		got = append(got, finding(c.SHA, ch.Path, f, m.Line, m.EndLine, severity, "model", "", strings.TrimSpace(m.Title), m.Detail, m.Suggestion, doubt))
+		fd := finding(c.SHA, ch.Path, f, m.Line, m.EndLine, severity, "model", "", strings.TrimSpace(m.Title), m.Detail, m.Suggestion, doubt)
+		// A model shown six calls that changed may report the same thing six times: once is enough.
+		if slices.ContainsFunc(got, func(g store.Finding) bool { return g.Key == fd.Key }) {
+			r.trail.discard(ch.Path, m.Line, fd.Title, "The model reported the same thing twice in one reply.")
+			dropped++
+			continue
+		}
+		r.trail.step(fd.Key, "quote", "passed", "The model quoted %q, and that code is at the line it named.", clipText(strings.TrimSpace(m.Evidence), 160))
+		if doubt != "" {
+			r.trail.step(fd.Key, "quote", "note", "%s", doubt)
+		}
+		got = append(got, fd)
 	}
 	return got, dropped, nil
 }
@@ -99,7 +127,8 @@ func (r *Reviewer) modelReview(ctx context.Context, c git.Commit, ch git.FileCha
 // repeatsRule says a code check already reported this line; the check's wording is exact.
 func repeatsRule(known []store.Finding, path string, line int) bool {
 	for _, k := range known {
-		if k.Source == "rule" && k.Path == path && line >= k.Line-1 && line <= k.EndLine+1 {
+		// A note is not a report: what a run showed without saying it is wrong must not silence the model on that line.
+		if k.Source == "rule" && k.Doubt == "" && k.Path == path && line >= k.Line-1 && line <= k.EndLine+1 {
 			return true
 		}
 	}
@@ -115,7 +144,7 @@ func userPrompt(c git.Commit, ch git.FileChange, f Parsed, lang string, known []
 	}
 	var already []string
 	for _, k := range known {
-		if k.Path == ch.Path {
+		if k.Path == ch.Path && k.Doubt == "" {
 			already = append(already, fmt.Sprintf("- line %d: %s", k.Line, k.Title))
 		}
 	}

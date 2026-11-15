@@ -301,7 +301,11 @@ type Call struct {
 	Error        string `json:"error,omitempty"`
 	TookMs       int64  `json:"tookMs"`
 	PromptTokens int    `json:"promptTokens,omitempty"`
-	ReplyTokens  int    `json:"replyTokens,omitempty"`
+	ReplyTokens  int    `json:"replyTokens,omitempty"` // while running: the pieces written so far
+	Phase        string `json:"phase,omitempty"`       // while running: reading (the prompt) or writing
+	FirstTokenMs int64  `json:"firstTokenMs,omitempty"`
+	PrefillMs    int64  `json:"prefillMs,omitempty"` // as the model server measured it, when done
+	DecodeMs     int64  `json:"decodeMs,omitempty"`
 	System       string `json:"system,omitempty"`
 	User         string `json:"user,omitempty"`
 	Response     string `json:"response,omitempty"`
@@ -319,14 +323,14 @@ func Watch() {
 	model.Observer = func(c model.Call) {
 		v := Call{ID: strconv.FormatInt(c.ID, 10), At: c.Start.UnixMilli(), Kind: or(c.Label.Kind, "model"), Title: or(c.Label.Title, firstHeading(c.User)),
 			Status: "running", Model: c.Model, SHA: c.Label.SHA, Path: c.Label.Path, System: c.System, User: c.User}
+		v.Response, v.Phase, v.FirstTokenMs = c.Reply, c.Phase, c.FirstToken.Milliseconds()
+		v.TookMs, v.PromptTokens, v.ReplyTokens = c.Usage.Took.Milliseconds(), c.Usage.PromptTokens, c.Usage.ReplyTokens
 		if c.Done {
-			v.Status, v.Response, v.Error = "done", c.Reply, c.Err
+			v.Status, v.Error, v.Phase = "done", c.Err, ""
 			if c.Err != "" {
 				v.Status = "failed"
 			}
-			v.TookMs, v.PromptTokens, v.ReplyTokens = c.Usage.Took.Milliseconds(), c.Usage.PromptTokens, c.Usage.ReplyTokens
-		} else {
-			v.TookMs = 0
+			v.PrefillMs, v.DecodeMs = c.Usage.Prefill.Milliseconds(), c.Usage.Decode.Milliseconds()
 		}
 		calls.mu.Lock()
 		i := -1

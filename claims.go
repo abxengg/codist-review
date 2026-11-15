@@ -19,7 +19,7 @@ func normalise(quote string) string {
 	for _, l := range strings.Split(quote, "\n") {
 		parts = append(parts, numbered.ReplaceAllString(l, ""))
 	}
-	return squash(strings.Join(parts, ""))
+	return sameMarks(strings.Join(parts, ""))
 }
 
 // quoted says whether the quote appears in the file within reach lines of line.
@@ -32,7 +32,7 @@ func quoted(lines []string, quote string, line, reach int) (inFile, near bool) {
 	starts := make([]int, len(lines))
 	for i, l := range lines {
 		starts[i] = whole.Len()
-		whole.WriteString(squash(l))
+		whole.WriteString(sameMarks(l))
 	}
 	text := whole.String()
 	for from := 0; ; {

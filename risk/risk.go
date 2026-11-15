@@ -3,7 +3,8 @@
 //
 // Labels come from the history itself (the SZZ method): for each commit whose message says it fixes something, the
 // lines it removed or changed are traced with git blame to the commits that wrote them, and those count as having
-// brought a bug. Commits where Codist found issues count too. The model is tested on the newest quarter of the
+// brought a bug. A commit that a later one reverts counts as well, and that label is the surer of the two: SZZ
+// labels are known to be noisy, a revert names its commit. Commits where Codist found issues count too. The model is tested on the newest quarter of the
 // history after training on the older three quarters, and only used when it ranks better than chance by a clear
 // margin; otherwise it says why, and Codist keeps its newest-first order.
 package risk
@@ -149,7 +150,7 @@ func Labels(repo *git.Repo, hist []git.CommitStat, blames int) map[string]bool {
 	for _, c := range hist {
 		in[c.SHA] = true
 	}
-	out := map[string]bool{}
+	out := Reverted(hist)
 	for i := len(hist) - 1; i >= 0 && blames > 0; i-- { // newest fixes first, while the budget lasts
 		c := hist[i]
 		if c.Parents != 1 || !IsFix(c.Subject) {
@@ -187,6 +188,24 @@ func Labels(repo *git.Repo, hist []git.CommitStat, blames int) map[string]bool {
 				}
 			}
 		}
+	}
+	return out
+}
+
+var revertOf = regexp.MustCompile(`^Revert "(.+)"$`)
+
+// Reverted finds the commits a later commit took back: git names a revert 'Revert "the subject"', so the newest
+// earlier commit with that subject is the one. A revert of a revert brings the change back and blames nothing.
+func Reverted(hist []git.CommitStat) map[string]bool {
+	out := map[string]bool{}
+	last := map[string]string{} // subject -> the newest commit so far with it
+	for _, c := range hist {
+		if m := revertOf.FindStringSubmatch(c.Subject); m != nil && !revertOf.MatchString(m[1]) {
+			if sha, ok := last[m[1]]; ok {
+				out[sha] = true
+			}
+		}
+		last[c.Subject] = c.SHA
 	}
 	return out
 }

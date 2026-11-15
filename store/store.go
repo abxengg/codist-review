@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -71,6 +72,14 @@ CREATE TABLE IF NOT EXISTS model_cache (
 CREATE TABLE IF NOT EXISTS review_stats (
 	sha        TEXT PRIMARY KEY,
 	stats      TEXT NOT NULL          -- what the model cost for this commit: calls, tokens, time
+);
+CREATE TABLE IF NOT EXISTS trails (
+	sha        TEXT PRIMARY KEY,
+	trail      TEXT NOT NULL          -- what the model understood, what was discarded, how each claim was checked
+);
+CREATE TABLE IF NOT EXISTS plans (
+	sha        TEXT PRIMARY KEY,
+	plan       TEXT NOT NULL          -- for each changed file: whether the model read it, why, and who decided
 );
 CREATE TABLE IF NOT EXISTS feedback (
 	key        TEXT PRIMARY KEY,      -- the issue key the person judged
@@ -221,6 +230,37 @@ func (s *Store) ReplaceFindings(sha string, fs []Finding) error {
 	if _, err := tx.Exec(`DELETE FROM findings WHERE sha=?`, sha); err != nil {
 		return err
 	}
+	if err := insertFindings(tx, sha, fs); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// AddFindings adds findings to a commit's, leaving the others as they are: for what is learned about a commit after
+// its review, such as what running its code showed. A finding already there, by its key, is not added again.
+func (s *Store) AddFindings(sha string, fs []Finding) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var fresh []Finding
+	for _, f := range fs {
+		var n int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM findings WHERE sha=? AND key=?`, sha, f.Key).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			fresh = append(fresh, f)
+		}
+	}
+	if err := insertFindings(tx, sha, fresh); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func insertFindings(tx *sql.Tx, sha string, fs []Finding) error {
 	for _, f := range fs {
 		if _, err := tx.Exec(`INSERT INTO findings (sha, path, line, end_line, severity, source, rule, title, detail, suggestion, snippet, doubt, key)
 			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, sha, f.Path, f.Line, f.EndLine, f.Severity, f.Source, f.Rule, f.Title,
@@ -239,7 +279,7 @@ func (s *Store) ReplaceFindings(sha string, fs []Finding) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // Findings reads one commit's findings with their issue state, most severe first.
@@ -662,4 +702,124 @@ func readFailed(what string, err error) {
 	if !errors.Is(err, sql.ErrNoRows) {
 		slog.Warn("database read failed", "lib", "store", "read", what, "err", err)
 	}
+}
+
+// Outcome is what became of the issues one check, or the model, has raised: how often a later commit removed the
+// flagged code, and how people judged them. A check whose issues are never acted on is noise.
+type Outcome struct {
+	Source string `json:"source"` // a check's name, or "model"
+	Found  int    `json:"found"`
+	Fixed  int    `json:"fixed"`  // closed by a later commit
+	ByHand int    `json:"byHand"` // closed by a person
+	Open   int    `json:"open"`
+	Useful int    `json:"useful"`
+	Wrong  int    `json:"wrong"`
+	// ActedOn is the share a commit fixed or a person closed or called useful, of those not still undecided: open
+	// issues nobody judged say nothing yet. -1 when nothing is decided.
+	ActedOn float64 `json:"actedOn"`
+}
+
+// Outcomes counts, for each check and for the model, what became of its issues, most issues first.
+func (s *Store) Outcomes() []Outcome {
+	rows, err := s.db.Query(`SELECT CASE i.rule WHEN '' THEN 'model' ELSE i.rule END, i.state, i.fixed_sha, COALESCE(f.verdict, '')
+		FROM issues i LEFT JOIN feedback f ON f.key = i.key`)
+	if err != nil {
+		readFailed("Outcomes", err)
+		return nil
+	}
+	defer rows.Close()
+	by := map[string]*Outcome{}
+	decided := map[string]int{}
+	for rows.Next() {
+		var source, state, fixed, verdict string
+		if rows.Scan(&source, &state, &fixed, &verdict) != nil {
+			continue
+		}
+		o := by[source]
+		if o == nil {
+			o = &Outcome{Source: source}
+			by[source] = o
+		}
+		o.Found++
+		acted := false
+		switch {
+		case verdict == "wrong":
+			o.Wrong++
+		case state == "resolved" && fixed == "manual":
+			o.ByHand++
+			acted = true
+		case state == "resolved":
+			o.Fixed++
+			acted = true
+		default:
+			o.Open++
+		}
+		if verdict == "useful" {
+			o.Useful++
+			acted = true
+		}
+		if acted || verdict == "wrong" {
+			decided[source]++
+		}
+		if acted {
+			o.ActedOn++
+		}
+	}
+	out := []Outcome{}
+	for src, o := range by {
+		if decided[src] == 0 {
+			o.ActedOn = -1
+		} else {
+			o.ActedOn /= float64(decided[src])
+		}
+		out = append(out, *o)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Found > out[j].Found || out[i].Found == out[j].Found && out[i].Source < out[j].Source
+	})
+	return out
+}
+
+// FilePlan is what was decided for one changed file of a commit: whether the model reads it, why, and who decided
+// (Codist for what is certain, the model for the rest, or the person who asked for the file).
+type FilePlan struct {
+	Path     string `json:"path"`
+	Decision string `json:"decision"` // read or skipped
+	Why      string `json:"why"`
+	By       string `json:"by"` // codist, model or you
+}
+
+// SetPlan stores a commit's reading plan.
+func (s *Store) SetPlan(sha string, plan []FilePlan) error {
+	raw, err := json.Marshal(plan)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT INTO plans (sha, plan) VALUES (?,?) ON CONFLICT(sha) DO UPDATE SET plan=excluded.plan`, sha, string(raw))
+	return err
+}
+
+// Plan reads a commit's reading plan, or nil when the model has not planned it.
+func (s *Store) Plan(sha string) []FilePlan {
+	var raw string
+	var plan []FilePlan
+	if s.db.QueryRow(`SELECT plan FROM plans WHERE sha=?`, sha).Scan(&raw) == nil {
+		_ = json.Unmarshal([]byte(raw), &plan)
+	}
+	return plan
+}
+
+// SetTrail stores what happened in a commit's model review.
+func (s *Store) SetTrail(sha string, trail json.RawMessage) error {
+	_, err := s.db.Exec(`INSERT INTO trails (sha, trail) VALUES (?,?) ON CONFLICT(sha) DO UPDATE SET trail=excluded.trail`, sha, string(trail))
+	return err
+}
+
+// Trail reads what happened in a commit's model review, or nil when the model has not read it.
+func (s *Store) Trail(sha string) json.RawMessage {
+	var raw string
+	if s.db.QueryRow(`SELECT trail FROM trails WHERE sha=?`, sha).Scan(&raw) != nil {
+		return nil
+	}
+	return json.RawMessage(raw)
 }
