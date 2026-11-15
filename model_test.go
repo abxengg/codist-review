@@ -1,6 +1,7 @@
 package review
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,7 @@ type fakeModel struct {
 	reply   string
 	judge   string // the reply to a second look, when set
 	plan    string // the reply when asked which files to read, when set
+	learn   string // the reply when asked to write a check from a fix, when set
 	other   string // how the second look chooses between the claim and its opposite: "" the claim, "fine", or "first"
 	prompts []string
 }
@@ -50,6 +52,15 @@ func (f *fakeModel) client(t *testing.T) *model.Client {
 		}
 		if f.plan != "" && strings.HasPrefix(req.Messages[0].Content, "You plan a code review") {
 			reply = f.plan
+		}
+		if strings.HasPrefix(req.Messages[0].Content, "You are shown one Java method") { // a method's promise, read off its code
+			reply = `{"reason":"returns the order or fails","returnsNull":false,"throws":[]}`
+			if strings.Contains(req.Messages[1].Content, "orElse(null)") {
+				reply = `{"reason":"returns null when there is no such order","returnsNull":true,"throws":[]}`
+			}
+		}
+		if strings.HasPrefix(req.Messages[0].Content, "A commit fixed a mistake") {
+			reply = cmp.Or(f.learn, `{"pattern":"","title":"","detail":""}`)
 		}
 		if strings.HasPrefix(req.Messages[0].Content, "Two code reviewers disagree") {
 			// It stands by the claim, wherever the claim is listed, unless other says "fine" (it sides with the
@@ -512,6 +523,9 @@ func TestReadsFirstThenSecondLooksAndTwice(t *testing.T) {
 	}
 	kinds := ""
 	for _, p := range fm.prompts {
+		if strings.HasPrefix(p, "You are shown one Java method") || strings.HasPrefix(p, "Two code reviewers disagree") {
+			continue // a method's promise and the choice after a second look are counted elsewhere
+		}
 		kinds += map[bool]string{true: "J", false: "R"}[strings.HasPrefix(p, "You check one claim")]
 	}
 	if kinds != "RRJ" {

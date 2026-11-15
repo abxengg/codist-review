@@ -117,6 +117,7 @@ func (r *Reviewer) Review(ctx context.Context, sha string, opt Options) error {
 		}
 		if !lang.IsTest(c.Path) {
 			findings = append(findings, r.specNumbers(sha, c, f)...)
+			findings = append(findings, r.learnedFindings(sha, c.Path, f, changed)...)
 		}
 		targets = append(targets, target{c, f})
 	}
@@ -170,6 +171,13 @@ func (r *Reviewer) Review(ctx context.Context, sha string, opt Options) error {
 		}
 		var reads []read
 		shown := r.ranAt(sha) // what running the code showed, when it has been run
+		var whole *code
+		codeOnce := func() *code { // the code at the commit with its call graph, read the first time it is needed
+			if whole == nil {
+				whole = r.codeAt(sha)
+			}
+			return whole
+		}
 		var files []planned
 		for _, t := range targets {
 			files = append(files, planned{t.change, t.file})
@@ -198,6 +206,11 @@ func (r *Reviewer) Review(ctx context.Context, sha string, opt Options) error {
 				continue
 			}
 			var readings []string
+			// Methods other files call whose promise got weaker: a model fact per method, joined to the callers. Only in
+			// the deep pass: on the three labs it added up to 70% more model calls and none of its findings hit a bug.
+			if opt.Deep {
+				got = append(got, r.promiseChanges(ctx, commit, t.change, t.file, codeOnce, &stats)...)
+			}
 			if opt.Twice {
 				readings = append(readings, secondReading)
 			}
@@ -264,8 +277,14 @@ func (r *Reviewer) Review(ctx context.Context, sha string, opt Options) error {
 		return nil
 	})
 	warnIf(r.Store.AddFindings(sha, late), "run findings not saved", "sha", c.Short)
+	closedBefore := len(r.Store.OpenIssueList())
 	r.resolve(sha, changes)
 	r.settle(sha, findings)
+	if r.Model != nil && !opt.RulesOnly { // a commit that fixed something teaches a check for the next time
+		if n := r.learn(ctx, c, changes, len(r.Store.OpenIssueList()) < closedBefore, &stats); n > 0 {
+			notes = append(notes, fmt.Sprintf("Codist learned %d check%s from this fix; it will look for the same mistake in later commits.", n, plural1(n)))
+		}
+	}
 	if stats.Hidden > 0 {
 		notes = append(notes, fmt.Sprintf("%d finding%s not shown because %s marked wrong before.", stats.Hidden, plural(stats.Hidden), map[bool]string{true: "it was", false: "they were"}[stats.Hidden == 1]))
 	}
@@ -508,6 +527,13 @@ func (r *Reviewer) Baseline(files map[string][]byte) (int, error) {
 		return 0, err
 	}
 	return len(findings), r.Store.SetReview(store.Review{SHA: BaselineSHA, Status: "done", Note: "Checked the whole code on first run.", Started: started, Finished: time.Now()})
+}
+
+func plural1(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 func plural(n int) string {

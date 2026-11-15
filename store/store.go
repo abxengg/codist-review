@@ -73,6 +73,10 @@ CREATE TABLE IF NOT EXISTS review_stats (
 	sha        TEXT PRIMARY KEY,
 	stats      TEXT NOT NULL          -- what the model cost for this commit: calls, tokens, time
 );
+CREATE TABLE IF NOT EXISTS learned (
+	id         TEXT PRIMARY KEY,
+	check_json TEXT NOT NULL          -- a check the model wrote from a fix and Codist proved
+);
 CREATE TABLE IF NOT EXISTS trails (
 	sha        TEXT PRIMARY KEY,
 	trail      TEXT NOT NULL          -- what the model understood, what was discarded, how each claim was checked
@@ -822,4 +826,39 @@ func (s *Store) Trail(sha string) json.RawMessage {
 		return nil
 	}
 	return json.RawMessage(raw)
+}
+
+// LearnedCheck is a check written by the model from a commit that fixed a mistake, and proved against that fix.
+type LearnedCheck struct {
+	ID, Pattern, Title, Detail, FixSHA, Path string
+	Learned                                  time.Time
+}
+
+// AddLearned keeps a learned check.
+func (s *Store) AddLearned(c LearnedCheck) error {
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT INTO learned (id, check_json) VALUES (?,?) ON CONFLICT(id) DO NOTHING`, c.ID, string(raw))
+	return err
+}
+
+// Learned lists the learned checks, oldest first.
+func (s *Store) Learned() []LearnedCheck {
+	rows, err := s.db.Query(`SELECT check_json FROM learned ORDER BY rowid`)
+	if err != nil {
+		readFailed("Learned", err)
+		return nil
+	}
+	defer rows.Close()
+	var out []LearnedCheck
+	for rows.Next() {
+		var raw string
+		var c LearnedCheck
+		if rows.Scan(&raw) == nil && json.Unmarshal([]byte(raw), &c) == nil {
+			out = append(out, c)
+		}
+	}
+	return out
 }
