@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/abxengg/codist-git"
+	"github.com/abxengg/codist-git/testrepo"
 	"github.com/abxengg/codist-review/store"
 )
 
@@ -225,5 +226,111 @@ func TestQuotesMatchWhateverTheQuotationMark(t *testing.T) {
 	if got := verdictOf("confirmed", "private static final String FORMULA_STARTS = =+@;", "", "The hyphen was removed.",
 		`    private static final String FORMULA_STARTS = "=+@";`); got != "confirmed" {
 		t.Errorf("a quote without its marks: %s", got)
+	}
+}
+
+// A commit that brought an issue is amended, so its id changes; a later commit fixes the issue. The issue is closed
+// although the commit it was first seen in is in no branch any more.
+func TestFixAfterRewrittenCommit(t *testing.T) {
+	tr, r, st := setup(t)
+	ctx := context.Background()
+	tr.Git("reset", "-q", "--hard", tr.Bug)
+	if err := r.Review(ctx, tr.Bug, Options{}); err != nil || len(st.OpenIssues(testrepo.ServicePath)) != 1 {
+		t.Fatalf("the bug opens one issue: %v %d", err, len(st.OpenIssues(testrepo.ServicePath)))
+	}
+	tr.Git("commit", "-q", "--amend", "-m", "Add discount, reworded")
+	amended := tr.Head()
+	if err := r.Review(ctx, amended, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if open := st.OpenIssues(testrepo.ServicePath); len(open) != 1 || open[0].FirstSHA != amended {
+		t.Errorf("the issue follows the commit that replaced its first one: %+v", open)
+	}
+	tr.Commit("Rethrow discount errors", map[string]string{testrepo.ServicePath: testrepo.ServiceFix})
+	if err := r.Review(ctx, tr.Head(), Options{}); err != nil || len(st.OpenIssues(testrepo.ServicePath)) != 0 {
+		t.Errorf("the fix closes it: %v %+v", err, st.OpenIssues(testrepo.ServicePath))
+	}
+}
+
+// The commits that brought an issue are thrown away with a reset and never reviewed again; the next commit that
+// changes the file closes the issue, which is no longer in the code.
+func TestFixAfterReset(t *testing.T) {
+	tr, r, st := setup(t)
+	ctx := context.Background()
+	tr.Git("reset", "-q", "--hard", tr.Bug)
+	if err := r.Review(ctx, tr.Bug, Options{}); err != nil || len(st.OpenIssues(testrepo.ServicePath)) != 1 {
+		t.Fatalf("the bug opens one issue: %v", err)
+	}
+	tr.Git("reset", "-q", "--hard", tr.Init)
+	tr.Git("branch", "-q", "-D", testrepo.Branch) // the other branch starts after the bug, so it would keep it alive
+	tr.Commit("Rethrow discount errors", map[string]string{testrepo.ServicePath: testrepo.ServiceFix})
+	if err := r.Review(ctx, tr.Head(), Options{}); err != nil || len(st.OpenIssues(testrepo.ServicePath)) != 0 {
+		t.Errorf("an issue of a commit that is gone is closed: %v %+v", err, st.OpenIssues(testrepo.ServicePath))
+	}
+}
+
+// A file with an open issue is renamed: the issue moves to the new name, and a fix there closes it.
+func TestIssueFollowsRenamedFile(t *testing.T) {
+	tr, r, st := setup(t)
+	ctx := context.Background()
+	tr.Git("reset", "-q", "--hard", tr.Bug)
+	if err := r.Review(ctx, tr.Bug, Options{}); err != nil || len(st.OpenIssues(testrepo.ServicePath)) != 1 {
+		t.Fatalf("the bug opens one issue: %v", err)
+	}
+	moved := strings.Replace(testrepo.ServicePath, "OrderService", "Orders", 1)
+	tr.Git("mv", testrepo.ServicePath, moved)
+	tr.Git("commit", "-q", "-m", "Rename the order service file")
+	if err := r.Review(ctx, tr.Head(), Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.OpenIssues(testrepo.ServicePath)) != 0 || len(st.OpenIssues(moved)) != 1 {
+		t.Fatalf("the issue moves with the file: %d under the old name, %d under the new", len(st.OpenIssues(testrepo.ServicePath)), len(st.OpenIssues(moved)))
+	}
+	if list := st.OpenIssueList(); len(list) != 1 || list[0].Path != moved {
+		t.Errorf("the list of open issues shows it under the new name: %+v", list)
+	}
+	tr.Commit("Rethrow discount errors", map[string]string{moved: testrepo.ServiceFix})
+	if err := r.Review(ctx, tr.Head(), Options{}); err != nil || len(st.OpenIssues(moved)) != 0 {
+		t.Errorf("the fix in the renamed file closes it: %v %+v", err, st.OpenIssues(moved))
+	}
+}
+
+// Catching up newest first, the commit that renamed a file is reviewed before the older commit that brought an issue
+// into it. The issue is then followed to the new name: open while it is still there, closed by the commit that fixed it.
+func TestOlderIssueFollowsLaterRename(t *testing.T) {
+	tr, r, st := setup(t)
+	ctx := context.Background()
+	tr.Git("reset", "-q", "--hard", tr.Bug)
+	moved := strings.Replace(testrepo.ServicePath, "OrderService", "Orders", 1)
+	tr.Git("mv", testrepo.ServicePath, moved)
+	tr.Git("commit", "-q", "-m", "Rename the order service file")
+	rename := tr.Head()
+	for _, sha := range []string{rename, tr.Bug} { // newest first
+		if err := r.Review(ctx, sha, Options{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(st.OpenIssues(testrepo.ServicePath)) != 0 || len(st.OpenIssues(moved)) != 1 {
+		t.Fatalf("still in the renamed file: %d under the old name, %d under the new", len(st.OpenIssues(testrepo.ServicePath)), len(st.OpenIssues(moved)))
+	}
+
+	tr2, r2, st2 := setup(t)
+	tr2.Git("reset", "-q", "--hard", tr2.Bug)
+	tr2.Git("mv", testrepo.ServicePath, moved)
+	tr2.Git("commit", "-q", "-m", "Rename the order service file")
+	rename = tr2.Head()
+	tr2.Commit("Rethrow discount errors", map[string]string{moved: testrepo.ServiceFix})
+	for _, sha := range []string{tr2.Head(), rename, tr2.Bug} {
+		if err := r2.Review(ctx, sha, Options{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(st2.OpenIssueList()); n != 0 {
+		t.Errorf("fixed after the rename, so closed: %d open", n)
+	}
+	for _, is := range st2.AllIssues() {
+		if is.State != "resolved" || is.FixedSHA != tr2.Head() {
+			t.Errorf("closed by the commit that fixed it: %+v", is.State+" "+is.FixedSHA)
+		}
 	}
 }

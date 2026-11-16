@@ -712,3 +712,23 @@ func TestOnTopic(t *testing.T) {
 		}
 	}
 }
+
+// With nothing else to read and older commits allowed, the model goes back past its usual history, newest first,
+// and leaves alone a commit it could not read.
+func TestNextOlder(t *testing.T) {
+	tr, r, st := setup(t)
+	r.Model = (&fakeModel{reply: `{"findings":[]}`}).client(t)
+	if got := NextOlder(st, r.Repo, 1); got != tr.Bug {
+		t.Errorf("the newest commit after the first is next: %s", got)
+	}
+	if err := r.Review(context.Background(), tr.Bug, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := NextOlder(st, r.Repo, 1); got != tr.Init {
+		t.Errorf("a commit the model has read is not offered again: %s", got)
+	}
+	st.SetReview(store.Review{SHA: tr.Init, Status: "done", Note: cannotRead + " (no answer); the code checks are done."})
+	if got := NextOlder(st, r.Repo, 1); got != "" {
+		t.Errorf("a commit the model could not read is left alone: %s", got)
+	}
+}

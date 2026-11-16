@@ -382,6 +382,45 @@ func (s *Store) Resolve(keys []string, sha string) error {
 	return nil
 }
 
+// Rehome records sha as the commit an issue started in, as when the commit it was first seen in was rewritten.
+func (s *Store) Rehome(key, sha string) error {
+	_, err := s.db.Exec(`UPDATE issues SET first_sha=? WHERE key=?`, sha, key)
+	return err
+}
+
+// Title is the title of an issue's findings, for an issue the model reported and no check names.
+func (s *Store) Title(key string) string {
+	var title string
+	_ = s.db.QueryRow(`SELECT title FROM findings WHERE key=? ORDER BY id LIMIT 1`, key).Scan(&title)
+	return title
+}
+
+// MoveIssue gives an issue a new key and file, as when its file is renamed. Its findings and what a person said
+// about it follow it. When the new key is taken, the same issue is already known under the new name and the old
+// one is dropped.
+func (s *Store) MoveIssue(key, newKey, newPath string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`UPDATE OR IGNORE issues SET key=?, path=? WHERE key=?`, []any{newKey, newPath, key}},
+		{`DELETE FROM issues WHERE key=?`, []any{key}},
+		{`UPDATE findings SET key=? WHERE key=?`, []any{newKey, key}},
+		{`UPDATE OR IGNORE feedback SET key=? WHERE key=?`, []any{newKey, key}},
+		{`DELETE FROM feedback WHERE key=?`, []any{key}},
+	} {
+		if _, err := tx.Exec(q.sql, q.args...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // OpenByFile counts open issues per file.
 func (s *Store) OpenByFile() map[string]int {
 	out := map[string]int{}

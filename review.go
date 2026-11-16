@@ -3,6 +3,7 @@
 package review
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
@@ -259,10 +260,11 @@ func (r *Reviewer) Review(ctx context.Context, sha string, opt Options) error {
 			warnIf(r.Store.ReplaceFindings(sha, findings), "progress not saved", "sha", c.Short) // show progress file by file
 		}
 		if reviewed > 0 && failures == reviewed { // the model read nothing: this is not a model review
+			r.rehome(sha, findings)
 			r.resolve(sha, changes)
 			r.settle(sha, findings)
 			warnIf(r.Store.SetReview(store.Review{SHA: sha, Status: "done", Started: started, Finished: time.Now(),
-				Note: "The model could not read this commit (" + notes[len(notes)-1] + "); the code checks are done."}), "review status not saved", "sha", c.Short)
+				Note: cannotRead + " (" + notes[len(notes)-1] + "); the code checks are done."}), "review status not saved", "sha", c.Short)
 			return ErrModelFailed
 		}
 	}
@@ -278,6 +280,7 @@ func (r *Reviewer) Review(ctx context.Context, sha string, opt Options) error {
 	})
 	warnIf(r.Store.AddFindings(sha, late), "run findings not saved", "sha", c.Short)
 	closedBefore := len(r.Store.OpenIssueList())
+	r.rehome(sha, findings)
 	r.resolve(sha, changes)
 	r.settle(sha, findings)
 	if r.Model != nil && !opt.RulesOnly { // a commit that fixed something teaches a check for the next time
@@ -340,6 +343,38 @@ func NextDeep(st *store.Store, repo *git.Repo, limit int) string {
 	return ""
 }
 
+// cannotRead starts the note of a review the model was asked for and could not do.
+const cannotRead = "The model could not read this commit"
+
+// NextOlder picks what a model lane with nothing else to do reads next when it may go back past its usual history:
+// the newest commit after the first skip that the model has not read, or "" when there is none. A commit whose
+// review failed or that the model could not read is left alone, so it is not tried for ever.
+func NextOlder(st *store.Store, repo *git.Repo, skip int) string {
+	log, _ := repo.LogRef("HEAD", 1_000_000)
+	reviews := st.Reviews()
+	for i, c := range log {
+		if rv := reviews[c.SHA]; i >= skip && rv.Model == "" && rv.Status != "failed" && !strings.HasPrefix(rv.Note, cannotRead) {
+			return c.SHA
+		}
+	}
+	return ""
+}
+
+// NextIdle picks what a model lane with nothing waiting reads next, and how: first a recent commit not yet read
+// deeply, when deep is on, then a commit older than the history the model usually reads, when older is on. The
+// recent commits are few and about the code as it is now, so they come first. It returns "" when there is nothing.
+func NextIdle(st *store.Store, repo *git.Repo, history int, deep, older bool) (string, Options) {
+	if deep {
+		if sha := NextDeep(st, repo, cmp.Or(history, 50)); sha != "" {
+			return sha, Options{Deep: true}
+		}
+	}
+	if older && history > 0 { // a history of 0 already means every commit
+		return NextOlder(st, repo, history), Options{}
+	}
+	return "", Options{}
+}
+
 // addNew adds to a file's findings those of a second reading that are not near one already there.
 func addNew(got, again []store.Finding) []store.Finding {
 	for _, a := range again {
@@ -362,9 +397,14 @@ func finding(sha, path string, f Parsed, line, end int, severity, source, rule, 
 	if what == "" {
 		what = strings.ToLower(title)
 	}
-	h := sha1.Sum([]byte(what + "\x00" + path + "\x00" + squash(snippet)))
 	return store.Finding{SHA: sha, Path: path, Line: line, EndLine: max(end, line), Severity: severity, Source: source, Rule: rule,
-		Title: title, Detail: detail, Suggestion: suggestion, Snippet: snippet, Doubt: doubt, Key: hex.EncodeToString(h[:8])}
+		Title: title, Detail: detail, Suggestion: suggestion, Snippet: snippet, Doubt: doubt, Key: keyOf(what, path, snippet)}
+}
+
+// keyOf names an issue by what it is (the check's rule, or the title in lower case), its file and its flagged line.
+func keyOf(what, path, snippet string) string {
+	h := sha1.Sum([]byte(what + "\x00" + path + "\x00" + squash(snippet)))
+	return hex.EncodeToString(h[:8])
 }
 
 var space = regexp.MustCompile(`\s+`)
@@ -382,6 +422,16 @@ func sameMarks(s string) string {
 // resolve closes open issues in the files a commit changed.
 func (r *Reviewer) resolve(sha string, changes []git.FileChange) {
 	for _, c := range changes {
+		if c.Status == "renamed" && c.OldPath != "" && c.OldPath != c.Path { // the file's issues go with it to its new name
+			var fixed []string
+			for _, o := range r.Store.OpenIssues(c.OldPath) {
+				if r.fixable(o.FirstSHA, sha) {
+					fixed = append(fixed, o.Key)
+				}
+			}
+			fixed, _ = r.moved(sha, c.OldPath, c.Path, fixed)
+			r.close(sha, c.OldPath, fixed)
+		}
 		open := r.Store.OpenIssues(c.Path)
 		if len(open) == 0 {
 			continue
@@ -398,12 +448,92 @@ func (r *Reviewer) resolve(sha string, changes []git.FileChange) {
 		// reviewed after newer ones, and the issues they brought are not in its code yet: that is not a fix.
 		var fixed []string
 		for _, k := range r.gone(sha, c.Path, src, c.Status != "deleted", open) {
-			if i := slices.IndexFunc(open, func(o store.OpenIssue) bool { return o.Key == k }); open[i].FirstSHA == BaselineSHA || r.Repo.IsAncestor(open[i].FirstSHA, sha) {
+			if i := slices.IndexFunc(open, func(o store.OpenIssue) bool { return o.Key == k }); r.fixable(open[i].FirstSHA, sha) {
 				fixed = append(fixed, k)
 			}
 		}
 		r.close(sha, c.Path, fixed)
 	}
+}
+
+// fixable says the commit sha can have fixed an issue first seen in the commit first: the issue was there before
+// it. An issue whose first commit is in no branch or tag any more, as after an amend, a rebase or a reset, was
+// there before any commit reviewed now.
+func (r *Reviewer) fixable(first, sha string) bool {
+	return first == BaselineSHA || r.Repo.IsAncestor(first, sha) || r.orphaned(first)
+}
+
+// orphaned says a commit is in no branch or tag: rewritten or thrown away.
+func (r *Reviewer) orphaned(sha string) bool {
+	if sha == "" || sha == BaselineSHA || sha == r.head || r.Repo.IsAncestor(sha, cmpOr(r.head, "HEAD")) {
+		return false
+	}
+	for _, ref := range r.Repo.Refs() {
+		if sha == ref.SHA || r.Repo.IsAncestor(sha, ref.SHA) {
+			return false
+		}
+	}
+	return true
+}
+
+// rehome gives the issues this commit reports again a first commit in the history under review, when the commit
+// they were first seen in is not in it: that commit was amended or rebased, or lives on another branch. Without
+// this no later commit could fix them, since a commit only fixes what came before it.
+func (r *Reviewer) rehome(sha string, findings []store.Finding) {
+	if sha != r.head && !r.Repo.IsAncestor(sha, r.head) {
+		return
+	}
+	open := map[string][]store.OpenIssue{}
+	for _, f := range findings {
+		if f.SHA != sha || f.Doubt != "" {
+			continue
+		}
+		if _, ok := open[f.Path]; !ok {
+			open[f.Path] = r.Store.OpenIssues(f.Path)
+		}
+		for _, o := range open[f.Path] {
+			if o.Key == f.Key && o.FirstSHA != sha && o.FirstSHA != BaselineSHA && o.FirstSHA != r.head && !r.Repo.IsAncestor(o.FirstSHA, r.head) {
+				warnIf(r.Store.Rehome(o.Key, sha), "issue's first commit not saved", "sha", sha[:min(7, len(sha))], "path", f.Path)
+			}
+		}
+	}
+}
+
+// moved follows a file renamed by the commit sha. Of the open issues of the old name listed in keys, those whose
+// flagged line is still in the file move to the new name, where they keep being followed; it returns the keys of the
+// others, which the commit removed, and the moved issues under their new keys.
+func (r *Reviewer) moved(sha, from, to string, keys []string) (gone []string, now []store.OpenIssue) {
+	src, ok := r.Repo.FileAt(sha, to)
+	text := squash(string(src))
+	for _, o := range r.Store.OpenIssues(from) {
+		if !slices.Contains(keys, o.Key) {
+			continue
+		}
+		if !ok || squash(o.Snippet) == "" || !strings.Contains(text, squash(o.Snippet)) {
+			gone = append(gone, o.Key)
+			continue
+		}
+		key := keyOf(cmpOr(o.Rule, strings.ToLower(r.Store.Title(o.Key))), to, o.Snippet)
+		if err := r.Store.MoveIssue(o.Key, key, to); err != nil {
+			logger().Warn("issue not moved with its file", "sha", sha[:min(7, len(sha))], "from", from, "to", to, "err", err)
+			continue
+		}
+		logger().Debug("issue moved with its file", "sha", sha[:min(7, len(sha))], "from", from, "to", to)
+		o.Key = key
+		now = append(now, o)
+	}
+	return gone, now
+}
+
+// renamedTo is the new name the commit sha gave the file path, or "" when it did not rename it.
+func (r *Reviewer) renamedTo(sha, path string) string {
+	changes, _ := r.Repo.Changes(sha)
+	for _, c := range changes {
+		if c.Status == "renamed" && c.OldPath == path && c.Path != path {
+			return c.Path
+		}
+	}
+	return ""
 }
 
 // settle closes the issues this commit opened that a later commit has already fixed. Codist reads its backlog newest
@@ -427,15 +557,30 @@ func (r *Reviewer) settle(sha string, findings []store.Finding) {
 				open = append(open, o)
 			}
 		}
-		for _, later := range r.Repo.Later(sha, path) {
-			if len(open) == 0 {
-				break
-			}
-			src, present := r.Repo.FileAt(later, path) // gone when that commit deleted or moved the file
-			fixed := r.gone(later, path, src, present, open)
-			r.close(later, path, fixed)
-			open = slices.DeleteFunc(open, func(o store.OpenIssue) bool { return slices.Contains(fixed, o.Key) })
+		r.settlePath(sha, path, open)
+	}
+}
+
+// settlePath goes through the commits after sha that changed path and closes the open issues each of them removed.
+// When one of them renamed the file, the issues still in it move to the new name and are settled there.
+func (r *Reviewer) settlePath(sha, path string, open []store.OpenIssue) {
+	for _, later := range r.Repo.Later(sha, path) {
+		if len(open) == 0 {
+			return
 		}
+		src, present := r.Repo.FileAt(later, path) // gone when that commit deleted or moved the file
+		fixed := r.gone(later, path, src, present, open)
+		if !present && len(fixed) > 0 {
+			if to := r.renamedTo(later, path); to != "" {
+				var now []store.OpenIssue
+				fixed, now = r.moved(later, path, to, fixed)
+				r.close(later, path, fixed)
+				r.settlePath(later, to, now)
+				return
+			}
+		}
+		r.close(later, path, fixed)
+		open = slices.DeleteFunc(open, func(o store.OpenIssue) bool { return slices.Contains(fixed, o.Key) })
 	}
 }
 
