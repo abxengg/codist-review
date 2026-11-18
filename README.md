@@ -11,7 +11,15 @@ How [Codist](https://github.com/abxengg/codist) reviews a commit, and where it k
   so it stops calling things missing that the commit adds elsewhere. A serious claim that survives is checked once
   more by a second look, and stays an alarm only when the model quotes code that proves it.
 - **Issues** are followed across commits by a key made of the rule or title, the file and the flagged line, so an
-  issue is reported once and closed by the commit that fixes it.
+  issue is reported once and closed by the commit that fixes it. An issue whose first commit was amended, rebased or
+  reset away can still be closed by a later fix, and an open issue moves with its file when the file is renamed.
+  Catching up newest first, an issue found in an old commit that a later commit already fixed is closed at once.
+- **Second look and forced choice:** a serious model claim is put to the model again with the code before and after;
+  it must quote the line that proves it, then pick between the claim and its opposite twice, in both orders.
+- **Reading plan:** above `MaxFiles` changed files, the model first says which files need reading and why; a person
+  can ask for a skipped file (`Options.Force`).
+- **Idle time:** `NextIdle` picks what an idle model lane reads: a recent commit through the specialist lenses
+  (`Options.Deep`), then a commit older than the usual history (`NextOlder`).
 - **Baseline** checks the whole code the first time Codist runs on a repository, crediting each issue to the commit
   that last changed its line.
 - **Learning from feedback**: with `Learn` on, the model sees a few findings this team marked wrong or useful, as
