@@ -38,6 +38,12 @@ func TestJudge(t *testing.T) {
   void g(String role) {
     if (!HR.equals(role)) { deny(); }
   }
+  Map<String, Integer> h() {
+    return new LinkedHashMap<String, Integer>(this.headerMap);
+  }
+  boolean i(Object o) {
+    return this.name.equals(o);
+  }
 }`, "\n")
 	cases := []struct {
 		name, severity, title, evidence, patch string
@@ -61,6 +67,13 @@ func TestJudge(t *testing.T) {
 		{"only says the message disagrees", "high", "Commit message contradicts code change", "return c.name();", "", 7, false, "low", true},
 		{"line outside the file", "high", "Wrong total", "return c.name();", "", 99, true, "", false},
 		{"null-safe equals, though a null check was removed", "high", "Null Pointer Exception", "if (!HR.equals(role)) { deny(); }", "-  if (role != null && role != HR) {\n", 23, false, "low", true},
+		{"a mismatch that is not about the message", "high", "Path separator mismatch on Windows causes file lookup failure", "return c.name();", "", 7, false, "high", false},
+		{"SQL's NULL is not a null claim", "high", "MySQL format no longer uses 'N' as the NULL string", "return c.name();", "", 7, false, "high", false},
+		{"returns null instead of a value is a wrong value, not a crash", "high", "isA matcher returns null instead of an instance of the class", "return c.name();", "", 7, false, "high", false},
+		{"a crash on null still needs a source", "high", "NullPointerException when c is null", "return c.name();", "", 7, false, "low", true},
+		{"a field read through this, whose null test the change removed", "high", "NullPointerException when headerMap is null", "return new LinkedHashMap<String, Integer>(this.headerMap);", "-        return this.headerMap == null ? null : new LinkedHashMap<String, Integer>(this.headerMap);\n", 26, false, "high", false},
+		{"a field read through this, nothing makes it null", "high", "NullPointerException when headerMap is null", "return new LinkedHashMap<String, Integer>(this.headerMap);", "", 26, false, "low", true},
+		{"a field called through this, its null test removed", "high", "NullPointerException on name", "return this.name.equals(o);", "-    return this.name != null && this.name.equals(o);\n", 29, false, "high", false},
 	}
 	for _, c := range cases {
 		drop, sev, doubt := judge(code, c.patch, c.line, c.severity, c.title, c.evidence)

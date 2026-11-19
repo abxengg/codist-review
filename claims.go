@@ -59,10 +59,18 @@ var (
 	vague       = regexp.MustCompile(`(?i)^(consider|you (may|might) want|it (may|might) be|review the|ensure that|make sure)\b`)
 	changeTitle = regexp.MustCompile(`(?i)^(improved|simplified|added|adding|renamed|refactored|updated|changed|moved|replaced|introduced|extracted|explicitly passing|use of)\b`)
 	nullClaim   = regexp.MustCompile(`(?i)\bnull|\bnpe\b|nullpointer`)
+	// Not a claim that something crashes on null: a method that returns null instead of a value is a wrong value, and
+	// NULL in capitals is SQL's. Those are ordinary claims and need no source of null.
+	nullNot     = regexp.MustCompile(`(?i)returns? null instead|instead of (returning )?null|null string`)
+	sqlNull     = regexp.MustCompile(`\bNULL\b`) // in capitals: SQL's, case matters
 	receiver    = regexp.MustCompile(`\b([A-Za-z_]\w*)\s*(?:\.\s*[A-Za-z_]\w*|\[)`)
 	removedNull = regexp.MustCompile(`(?m)^-[^-].*\bnull\b`)
 	neverNull   = regexp.MustCompile(`\.(orElseThrow|orElse|orElseGet|requireNonNull)\(|\bnew\s`)
-	onlyMessage = regexp.MustCompile(`(?i)commit message|message (does not|doesn't|do not) match|contradicts the (commit|message)|mismatch`)
+	thisField   = regexp.MustCompile(`\bthis\.([a-z_]\w*)\b(?:\s*[^\s(]|\s*$)`)
+	equalsArg   = regexp.MustCompile(`(equals|==|!=)\s*\(?\s*$`)
+	// A claim that only says the commit message and the code disagree. "Mismatch" alone is not that: a path separator
+	// or a type mismatch is a real problem.
+	onlyMessage = regexp.MustCompile(`(?i)commit message|message (does not|doesn't|do not) match|contradicts the (commit|message)|message mismatch|mismatch (with|between) (the )?(commit )?message`)
 )
 
 var severities = []string{"critical", "high", "medium", "low", "info"}
@@ -89,7 +97,7 @@ func judge(lines []string, patch string, line int, severity, title, evidence str
 		switch {
 		case changeTitle.MatchString(strings.TrimSpace(title)):
 			doubt = "This describes the change and names no problem in it."
-		case nullClaim.MatchString(title) && !nullBacked(evidence, lines, line, patch):
+		case nullClaim.MatchString(title) && !nullNot.MatchString(title) && !sqlNull.MatchString(title) && !nullBacked(evidence, lines, line, patch):
 			doubt = "Codist could not find where this value becomes null in this code."
 		case onlyMessage.MatchString(title):
 			doubt = "This says the commit message and the code disagree, but not what now goes wrong."
@@ -108,9 +116,11 @@ func judge(lines []string, patch string, line int, severity, title, evidence str
 // nearby code tests the value for null, sets it to null, or takes it from a call that returns null
 // on a miss.
 func nullBacked(evidence string, lines []string, line int, patch string) bool {
-	// A null error needs a value used with a dot while null. In !HR.equals(role) or Objects.equals(a, b) nothing
-	// that can be null is used that way, so the claim has nothing to stand on, whatever the change removed.
-	if !dereferences(evidence) {
+	// A null error needs a value that can be null used where null fails: called with a dot, or a field handed to code
+	// that needs a value (new LinkedHashMap<>(this.map)). In !HR.equals(role) or Objects.equals(a, b) nothing that can
+	// be null is used that way, so the claim has nothing to stand on, whatever the change removed.
+	names := usedNames(evidence)
+	if len(names) == 0 {
 		return false
 	}
 	if removedNull.MatchString(patch) {
@@ -118,9 +128,9 @@ func nullBacked(evidence string, lines []string, line int, patch string) bool {
 	}
 	from, to := max(0, line-31), min(len(lines), line+30)
 	near := strings.Join(lines[from:to], "\n")
-	for _, m := range receiver.FindAllStringSubmatch(evidence, -1) {
-		v := regexp.QuoteMeta(m[1])
-		source := `(?m)\b` + v + `\s*[!=]=\s*null\b|\bnull\s*[!=]=\s*` + v + `\b|\b` + v + `\s*=\s*null\b|@Nullable\b[^;\n]*\b` + v +
+	for _, name := range names {
+		v := regexp.QuoteMeta(name)
+		source := `(?m)\b` + v + `\s*[!=]=\s*null\b|\bnull\s*[!=]=\s*(this\.)?` + v + `\b|\b` + v + `\s*=\s*null\b|@Nullable\b[^;\n]*\b` + v +
 			`\b|\b` + v + `\s*=[^;\n]*\.(get|find\w*|remove|poll|peek\w*|getProperty|getenv|getParameter|getHeader|getAttribute|lookup)\(`
 		for _, hit := range regexp.MustCompile(source).FindAllString(near, -1) {
 			if !neverNull.MatchString(lineOf(near, hit)) { // orElseThrow() or new never gives null
@@ -131,8 +141,24 @@ func nullBacked(evidence string, lines []string, line int, patch string) bool {
 	return false
 }
 
-// dereferences says the quoted code uses a value that could be null with a dot or an index: a variable, not a
-// constant (HR), a type (Objects, String) or this.
+// usedNames lists the values in code that would fail if they were null: receivers of a call or field access, and
+// fields read through this (this.map), unless they are only compared with equals.
+func usedNames(code string) []string {
+	var out []string
+	for _, m := range receiver.FindAllStringSubmatch(code, -1) {
+		if name := m[1]; name != "this" && name != "super" && !(name[0] >= 'A' && name[0] <= 'Z') {
+			out = append(out, name)
+		}
+	}
+	for _, m := range thisField.FindAllStringSubmatchIndex(code, -1) {
+		name, before := code[m[2]:m[3]], code[:m[0]]
+		if !equalsArg.MatchString(before) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 func dereferences(code string) bool {
 	for _, m := range receiver.FindAllStringSubmatch(code, -1) {
 		name := m[1]
