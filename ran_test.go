@@ -80,13 +80,13 @@ func TestWhatRunningShowed(t *testing.T) {
 	}
 }
 
-// A second look that confirms with a real quote but a guessing reason ("may") makes a note, unless running the code
+// A second look that sides with the claim with a real quote but a guessing reason ("may") makes a note, unless running the code
 // showed that this file's results did change: then the effect is no guess.
 func TestRunEvidenceBacksAHedgedConfirmation(t *testing.T) {
 	for _, ran := range []bool{false, true} {
 		tr, r, st := setup(t)
 		fm := &fakeModel{reply: `{"findings":[{"line":23,"severity":"high","title":"Charges twice","evidence":"payments.charge(o.getId());","detail":"d"}]}`,
-			judge: `{"clears":"","proves":"payments.charge(o.getId());","reason":"The loop may charge an order twice.","verdict":"reviewer_is_right"}`}
+			reason: "The loop may charge an order twice."}
 		r.Model = fm.client(t)
 		if ran {
 			st.SetBehaviour(tr.Bug, json.RawMessage(`{"differ":1,"differences":[{"method":"com.shop.order.OrderService#payAll","call":"payAll([])","old":"1","new":"2"}]}`))

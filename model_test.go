@@ -25,7 +25,9 @@ type fakeModel struct {
 	mu      sync.Mutex
 	status  int
 	reply   string
-	judge   string // the reply to a second look, when set
+	judge   string // the reply to the old yes-or-no second look; no longer asked
+	reason  string // the choice's reason, when set
+	proves  string // the choice's quoted proof: payments.charge(o.getId()); unless set ("-" for none)
 	plan    string // the reply when asked which files to read, when set
 	learn   string // the reply when asked to write a check from a fix, when set
 	other   string // how the second look chooses between the claim and its opposite: "" the claim, "fine", "first", or "first-off" (first, with reasons off the point)
@@ -67,11 +69,15 @@ func (f *fakeModel) client(t *testing.T) *model.Client {
 			// code) or "first" (it picks whoever is listed first).
 			claimIsA := !strings.Contains(req.Messages[1].Content, "Reviewer A says: The code after the commit is correct")
 			right := map[bool]string{true: "A", false: "B"}[claimIsA != (f.other == "fine") || strings.HasPrefix(f.other, "first")]
-			reason := "line 23 charges each order in the loop"
+			reason := cmp.Or(f.reason, "line 23 charges each order in the loop")
 			if f.other == "first-off" { // reasons about something else
 				reason = "rule 12 counts department heads"
 			}
-			reply = `{"reason":"` + reason + `","right":"` + right + `"}`
+			proves := cmp.Or(f.proves, "payments.charge(o.getId());")
+			if proves == "-" {
+				proves = ""
+			}
+			reply = `{"proves":"` + proves + `","reason":"` + reason + `","right":"` + right + `"}`
 		}
 		b, _ := json.Marshal(map[string]any{"message": map[string]string{"content": reply}})
 		w.Write(b)
@@ -441,17 +447,25 @@ func TestUsage(t *testing.T) {
 	}
 }
 
-// A serious finding the second look disproves stays visible as a note with the reason; one it confirms is kept. The
-// judge sees the code, the change and the definition of a project type the claim names.
+// A serious finding the second look sides against stays visible as a note with the reason; one it sides with and
+// proves with a line of the code is kept; one it sides with but cannot prove becomes a note. The judge sees the code,
+// the change and the definition of a project type the claim names. No yes-or-no question is asked.
 func TestSecondLook(t *testing.T) {
 	for _, c := range []struct {
-		verdict, severity string
-		doubted           bool
-	}{{"refuted", "low", true}, {"confirmed", "medium", false}, {"unsure", "medium", false}} {
+		other, proves, severity string
+		doubted                 bool
+		why                     string
+	}{
+		{"fine", "", "low", true, "charges each order"},
+		{"", "", "medium", false, ""},
+		{"", "-", "low", true, "could not point at the line"},
+		{"", "a line that is nowhere", "low", true, "could not point at the line"},
+	} {
 		tr, r, st := setup(t)
 		fm := &fakeModel{
-			reply: `{"findings":[{"line":23,"severity":"medium","title":"Charge in a loop","evidence":"payments.charge(o.getId());","detail":"Order may be charged twice"}]}`,
-			judge: `{"clears":"payments.charge(o.getId());","proves":"payments.charge(o.getId());","verdict":"` + c.verdict + `","reason":"payments.charge(o.getId()) runs once per order"}`,
+			reply:  `{"findings":[{"line":23,"severity":"medium","title":"Charge in a loop","evidence":"payments.charge(o.getId());","detail":"Order may be charged twice"}]}`,
+			other:  c.other,
+			proves: c.proves,
 		}
 		r.Model = fm.client(t)
 		if err := r.Review(context.Background(), tr.Bug, Options{}); err != nil {
@@ -463,31 +477,31 @@ func TestSecondLook(t *testing.T) {
 				f = x
 			}
 		}
-		if f.Severity != c.severity || (f.Doubt != "") != c.doubted {
-			t.Errorf("%s: %+v", c.verdict, f)
-		}
-		if c.verdict == "refuted" && !strings.Contains(f.Doubt, "runs once per order") {
-			t.Errorf("the note says why: %q", f.Doubt)
+		if f.Severity != c.severity || (f.Doubt != "") != c.doubted || !strings.Contains(f.Doubt, c.why) {
+			t.Errorf("%q/%q: %+v", c.other, c.proves, f)
 		}
 		var judged string
 		for _, p := range fm.prompts {
 			if strings.HasPrefix(p, "You check one claim") {
+				t.Error("the yes-or-no second look was asked")
+			}
+			if strings.HasPrefix(p, "Two code reviewers disagree") {
 				judged = p
 			}
 		}
-		for _, want := range []string{"## The claim", "Charge in a loop", "## Commit\nAdd discount", "```diff", "## Definition of Order"} {
+		for _, want := range []string{"Charge in a loop", "## Commit\nAdd discount", "```diff", "## Definition of Order", `"proves"`} {
 			if !strings.Contains(judged, want) {
-				t.Errorf("%s: judge prompt lacks %q:\n%s", c.verdict, want, judged)
+				t.Errorf("%q: choice prompt lacks %q:\n%s", c.other, want, judged)
 			}
 		}
 	}
 	// Turned off, no second look is asked for.
 	tr, r, _ := setup(t)
-	fm := &fakeModel{reply: `{"findings":[{"line":23,"severity":"high","title":"Charge in a loop","evidence":"payments.charge(o.getId());","detail":"d"}]}`, judge: `{"verdict":"reviewer_is_wrong","reason":"r"}`}
+	fm := &fakeModel{reply: `{"findings":[{"line":23,"severity":"high","title":"Charge in a loop","evidence":"payments.charge(o.getId());","detail":"d"}]}`}
 	r.Model, r.NoSecondLook = fm.client(t), true
 	r.Review(context.Background(), tr.Bug, Options{})
 	for _, p := range fm.prompts {
-		if strings.HasPrefix(p, "You check one claim") {
+		if strings.HasPrefix(p, "Two code reviewers disagree") {
 			t.Error("second look asked for while turned off")
 		}
 	}
@@ -527,12 +541,12 @@ func TestReadsFirstThenSecondLooksAndTwice(t *testing.T) {
 	}
 	kinds := ""
 	for _, p := range fm.prompts {
-		if strings.HasPrefix(p, "You are shown one Java method") || strings.HasPrefix(p, "Two code reviewers disagree") {
-			continue // a method's promise and the choice after a second look are counted elsewhere
+		if strings.HasPrefix(p, "You are shown one Java method") {
+			continue // a method's promise is counted elsewhere
 		}
-		kinds += map[bool]string{true: "J", false: "R"}[strings.HasPrefix(p, "You check one claim")]
+		kinds += map[bool]string{true: "J", false: "R"}[strings.HasPrefix(p, "Two code reviewers disagree")]
 	}
-	if kinds != "RRJ" {
+	if kinds != "RRJJ" {
 		t.Errorf("calls in order %s, want both reads and then the second look", kinds)
 	}
 	fm.prompts = nil
@@ -693,7 +707,7 @@ func TestTrail(t *testing.T) {
 	for _, s := range got.Steps[key] {
 		steps += s.Step + "=" + s.Result + "; "
 	}
-	for _, want := range []string{"quote=passed", "second look=confirmed", "choice=sided with the claim", "result=kept"} {
+	for _, want := range []string{"quote=passed", "choice=sided with the claim", "proof=passed", "result=kept"} {
 		if !strings.Contains(steps, want) {
 			t.Errorf("steps lack %q: %s", want, steps)
 		}
