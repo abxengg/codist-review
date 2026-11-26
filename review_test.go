@@ -232,13 +232,10 @@ func TestQuotesMatchWhateverTheQuotationMark(t *testing.T) {
 	if drop, _, _ := judge(lines, "", 2, "high", "Pause never works", "if (key.equals('P')) {"); drop != "" {
 		t.Errorf("a quote with single quotes was dropped: %s", drop)
 	}
-	if got := verdictOf("confirmed", "key.equals('P')", "", "It compares by value.", `if (key.equals("P")) {`); got != "confirmed" {
-		t.Errorf("second look quote: %s", got)
-	}
 	// A quote that leaves the marks out altogether matches too.
-	if got := verdictOf("confirmed", "private static final String FORMULA_STARTS = =+@;", "", "The hyphen was removed.",
-		`    private static final String FORMULA_STARTS = "=+@";`); got != "confirmed" {
-		t.Errorf("a quote without its marks: %s", got)
+	lines = []string{"class Csv {", `    private static final String FORMULA_STARTS = "=+@";`, "}"}
+	if drop, _, _ := judge(lines, "", 2, "high", "Hyphen removed", "private static final String FORMULA_STARTS = =+@;"); drop != "" {
+		t.Errorf("a quote without its marks was dropped: %s", drop)
 	}
 }
 

@@ -15,55 +15,23 @@ import (
 )
 
 // JudgeVersion names the second look's instructions, so cached verdicts from older wording are not reused.
-const JudgeVersion = "judge-10"
+const JudgeVersion = "judge-9"
 
 // The second look is one question: two reviewers, one with the claim and one saying the code is fine, and the
 // judge names the one who is right, asked in both orders. It used to start with a yes-or-no question ("is the
-// reviewer right?"), but Qwen 3.5 answered yes 45 times in 49 on the three labs (2026-11-26) and confirmed a claim
-// and its opposite 14 times in 15 (2026-11-15): a model asked to check itself agrees (Huang et al., ICLR 2024;
-// Stechly et al., ICLR 2025; Sharma et al., ICLR 2024). What made that question useful is kept, and done by Codist
-// rather than the model: the judge must quote the line that does the wrong thing, the quote must be in the code it
-// was shown, and a reason that only guesses ("might", "may") does not count.
-
-// hedged is a reason that guesses: a confirmation that something "might" be wrong confirms nothing.
-var hedged = regexp.MustCompile(`(?i)\b(might|may|could|possibly|potentially|perhaps|likely|appears? to|seems? to)\b`)
-
-// verdictOf is what Codist makes of a judge's answer: it counts only when the code it quotes is really in the code
-// the judge was shown (shown: that code as written, without line numbers or diff marks). The choice uses it with
-// "confirmed" for an answer that sides with the claim.
-//   - "confirmed": a real quote, and a reason that does not guess. The finding stays an alarm.
-//   - "hedged": a real quote, but the reason guesses ("might", "may"). A note, unless running the code showed that
-//     this file's results did change: then the effect is no guess, and the finding stays.
-//   - "unproven": no quote of real code. A claim that cannot point at code is a guess: a note.
-//   - "refuted": refuted with a real quote of the code that disproves it: a note, with the reason.
-//   - "unsure": anything else, a refutation with no quote included. The finding stays as it was.
-func verdictOf(verdict, proof, against, reason, shown string) string {
-	in := func(q string) bool { q = sameMarks(q); return q != "" && strings.Contains(sameMarks(shown), q) }
-	switch verdict {
-	case "confirmed":
-		// A small model sometimes puts its one quote in the wrong field: a confirmation that quotes real code and
-		// names nothing against the claim is still a confirmation with proof.
-		switch quoted := in(proof) || proof == "" && in(against); {
-		case quoted && !hedged.MatchString(reason):
-			return "confirmed"
-		case quoted:
-			return "hedged"
-		}
-		return "unproven"
-	case "refuted":
-		if in(against) {
-			return "refuted"
-		}
-	}
-	return "unsure"
-}
+// reviewer right?"). Qwen 3.5 answered yes 45 times in 49 on the three labs (2026-11-26) and confirmed a claim and
+// its opposite 14 times in 15 (2026-11-15), as research on models checking themselves predicts (Huang et al., ICLR
+// 2024; Stechly et al., ICLR 2025; Sharma et al., ICLR 2024). Worse, its "could not tell", or a failed call, kept a
+// finding as an alarm without the choice: both clean-commit alarms of the lab replays came through that way. With
+// every serious finding put to the choice, the replay found 60 of 62 planted bugs and alarmed 0 of 14 clean commits,
+// against 59 and 2 with the yes-or-no step. A version that also made the judge quote proof did worse (57 of 62): it
+// sided with the code on real bugs whose proof it said it could not see. The choice's wording is judge-9's, unchanged.
 
 var typeName = regexp.MustCompile(`\b[A-Z][a-z]\w*\b`)
 
-// secondLook checks each serious finding the model made on one file: the model is made to choose between the claim
-// and the code, and must point at the line that does the wrong thing. Only a claim it sides with, proven by a line it
-// was shown, stays an alarm; one it sides against or cannot prove is kept as a note with the reason, so a person can
-// still see it. Notes and low findings are left as they are: they raise no alarm.
+// secondLook checks each serious finding the model made on one file by making the model choose between the claim and
+// the code. A claim it sides with stays an alarm; one it sides against, or cannot decide on, is kept as a note with
+// the reason, so a person can still see it. Notes and low findings are left as they are: they raise no alarm.
 func (r *Reviewer) secondLook(ctx context.Context, c git.Commit, ch git.FileChange, after []string, got []store.Finding, st *Stats) []store.Finding {
 	var before []string
 	if len(c.Parents) > 0 && ch.Status != "added" {
@@ -78,18 +46,12 @@ func (r *Reviewer) secondLook(ctx context.Context, c git.Commit, ch git.FileChan
 	if r.Rules != "" {
 		rules = "\n\n## The team's rules\n" + clip(r.Rules, 3000)
 	}
-	ranHere := false // running the code showed this file's methods now give other results
-	if rep := r.ranAt(c.SHA); rep != nil {
-		for _, d := range rep.Differences {
-			ranHere = ranHere || classFile(d.Method, ch.Path)
-		}
-	}
 	for i, f := range got {
 		if f.Doubt != "" || f.Severity == "low" || f.Severity == "info" {
 			continue
 		}
-		prompt, shown := r.judgePrompt(c, ch, after, before, f)
-		side, why, proof := r.choose(ctx, c, ch, f, rules, prompt, st)
+		prompt, _ := r.judgePrompt(c, ch, after, before, f)
+		side, why := r.choose(ctx, c, ch, f, rules, prompt, st)
 		doubt := ""
 		switch side {
 		case "fine":
@@ -97,27 +59,13 @@ func (r *Reviewer) secondLook(ctx context.Context, c git.Commit, ch git.FileChan
 		case "undecided":
 			doubt = "A second look could not choose between this claim and its opposite, so it settles nothing."
 		case "claim", "split":
-			switch verdictOf("confirmed", proof, "", why, shown) {
-			case "unproven":
-				r.trail.step(f.Key, "proof", "none", "It sided with the claim but quoted no line of the code it was shown that does it.")
-				doubt = "A second look sided with the claim but could not point at the line that does it."
-			case "hedged":
-				r.trail.step(f.Key, "proof", "guessing", "%s", why)
-				if ranHere {
-					r.trail.step(f.Key, "proof", "backed by a run", "Running the code showed this file's results changed.")
-				} else {
-					doubt = "A second look sided with the claim, but its reason only guesses: " + why
-				}
-			default:
-				r.trail.step(f.Key, "proof", "passed", "It quoted %q, which is in the code.", clipText(strings.TrimSpace(proof), 160))
-			}
-			if doubt == "" && side == "split" && slices.Index(severities, got[i].Severity) < slices.Index(severities, "medium") {
+			if side == "split" && slices.Index(severities, got[i].Severity) < slices.Index(severities, "medium") {
 				got[i].Severity = "medium"
 			}
 		default: // the model did not answer: the finding stays as it was
 			continue
 		}
-		logger().Debug("second look", "sha", c.Short, "path", ch.Path, "line", f.Line, "title", f.Title, "side", side, "proof", proof, "doubt", doubt)
+		logger().Debug("second look", "sha", c.Short, "path", ch.Path, "line", f.Line, "title", f.Title, "side", side, "doubt", doubt)
 		if doubt != "" {
 			got[i].Doubt, got[i].Severity = doubt, "low"
 			st.Refuted++
@@ -129,21 +77,16 @@ func (r *Reviewer) secondLook(ctx context.Context, c git.Commit, ch git.FileChan
 const chooseSystem = `Two code reviewers disagree about one place in a commit. You are shown the code before and
 after the commit, the definitions of the project types it uses, and the team's rules. Decide only from the code shown.
 A problem is something the program does wrong when it runs: a wrong result, a crash, lost data, a broken rule of the
-team. Exactly one of the two reviewers is right. Reply with JSON only:
-- "proves": the line of code shown, after the commit, that does the wrong thing the claim describes, copied exactly
-  as it is written there, or "" when no line shown does it. A guess about code you cannot see is not proof.
-- "reason": one plain sentence that names the line of code or the rule that decides it.
-- "right": "A" or "B".
-Never type a double quote inside the texts you write; type a single quote in its place.`
+team. Exactly one of the two reviewers is right. Reply with JSON only: "reason", one plain sentence that names the
+line of code or the rule that decides it, then "right": "A" or "B". Never type a double quote inside the reason.`
 
 var chooseSchema = map[string]any{
 	"type": "object",
 	"properties": map[string]any{
-		"proves": text(400),
 		"reason": text(300),
 		"right":  map[string]any{"type": "string", "enum": []string{"A", "B"}},
 	},
-	"required": []string{"proves", "reason", "right"},
+	"required": []string{"reason", "right"},
 }
 
 const codeIsFine = "The code after the commit is correct at this place: it breaks no rule of the team and nothing goes wrong when it runs. The other reviewer is mistaken."
@@ -152,13 +95,12 @@ const codeIsFine = "The code after the commit is correct at this place: it break
 // (position bias: Wang et al., ACL 2024; Zheng et al., 2023). It answers "claim" when the judge picks the claim both
 // times, "fine" when it picks the code both times (with its reason), "split" when its answers follow the order but
 // both reasons speak of the claim, "undecided" when they follow the order otherwise, and "failed" when the model did
-// not answer. why and proof are from the answers that sided with the claim.
-func (r *Reviewer) choose(ctx context.Context, c git.Commit, ch git.FileChange, f store.Finding, rules, prompt string, st *Stats) (side, why, proof string) {
+// not answer. why is the judge's last reason.
+func (r *Reviewer) choose(ctx context.Context, c git.Commit, ch git.FileChange, f store.Finding, rules, prompt string, st *Stats) (side, why string) {
 	claim := strings.TrimSpace(f.Title + ". " + f.Detail)
-	picked, reasons, proofs := [2]string{}, [2]string{}, [2]string{}
+	picked, reasons := [2]string{}, [2]string{}
 	for i, order := range [2][2]string{{claim, codeIsFine}, {codeIsFine, claim}} {
 		var out struct {
-			Proves string `json:"proves"`
 			Reason string `json:"reason"`
 			Right  string `json:"right"`
 		}
@@ -172,7 +114,7 @@ func (r *Reviewer) choose(ctx context.Context, c git.Commit, ch git.FileChange, 
 				chooseSystem+rules, q, chooseSchema, &out)
 			if err != nil {
 				logger().Warn("second look failed; finding kept as it was", "sha", c.Short, "path", ch.Path, "line", f.Line, "err", err)
-				return "failed", "", ""
+				return "failed", ""
 			}
 			st.add(u)
 			if raw, err := json.Marshal(out); err == nil {
@@ -183,22 +125,8 @@ func (r *Reviewer) choose(ctx context.Context, c git.Commit, ch git.FileChange, 
 		r.trail.step(f.Key, "choice", map[string]string{"claim": "sided with the claim", "fine": "sided with the code"}[picked[i]],
 			"%s the claim listed %s. %s", map[bool]string{true: "Asked with", false: "Asked again with"}[i == 0], map[bool]string{true: "first", false: "second"}[i == 0], strings.TrimSpace(out.Reason))
 		why = strings.TrimSpace(out.Reason)
-		reasons[i], proofs[i] = why, strings.TrimSpace(out.Proves)
+		reasons[i] = why
 		logger().Debug("second look, choice", "sha", c.Short, "path", ch.Path, "line", f.Line, "title", f.Title, "order", i, "right", out.Right, "picked", picked[i], "reason", out.Reason)
-	}
-	// The claim side's reason and proof: the first answer that picked the claim and quoted something.
-	forClaim := func() (string, string) {
-		for i := range picked {
-			if picked[i] == "claim" && proofs[i] != "" {
-				return reasons[i], proofs[i]
-			}
-		}
-		for i := range picked {
-			if picked[i] == "claim" {
-				return reasons[i], proofs[i]
-			}
-		}
-		return "", ""
 	}
 	if picked[0] != picked[1] {
 		// Answers that follow the order, with both reasons about what the claim says: the judge argued the point
@@ -207,22 +135,17 @@ func (r *Reviewer) choose(ctx context.Context, c git.Commit, ch git.FileChange, 
 		// medium at most, for a person to judge (Wang et al. send such cases to a human).
 		if onTopic(claim, reasons[0]) && onTopic(claim, reasons[1]) {
 			r.trail.step(f.Key, "choice", "split, kept", "Its answers followed the order, but both of its reasons spoke of the claim, so the claim stands.")
-			why, proof = forClaim()
-			return "split", why, proof
+			return "split", why
 		}
-		return "undecided", "", ""
+		return "undecided", ""
 	}
 	// A choice for the claim counts only when the judge's reasons speak of what the claim says. Qwen 3.5 picked
 	// "non-deterministic lookup on duplicate department codes" twice for reasons about head counts and personal data.
 	if picked[0] == "claim" && !(onTopic(claim, reasons[0]) && onTopic(claim, reasons[1])) {
 		r.trail.step(f.Key, "choice", "off the point", "Its reasons for the claim were about something else.")
-		return "undecided", "", ""
+		return "undecided", ""
 	}
-	if picked[0] == "claim" {
-		why, proof = forClaim()
-		return "claim", why, proof
-	}
-	return "fine", why, ""
+	return picked[0], why
 }
 
 // usual are words that say nothing about what a claim is about.

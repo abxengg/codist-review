@@ -27,7 +27,6 @@ type fakeModel struct {
 	reply   string
 	judge   string // the reply to the old yes-or-no second look; no longer asked
 	reason  string // the choice's reason, when set
-	proves  string // the choice's quoted proof: payments.charge(o.getId()); unless set ("-" for none)
 	plan    string // the reply when asked which files to read, when set
 	learn   string // the reply when asked to write a check from a fix, when set
 	other   string // how the second look chooses between the claim and its opposite: "" the claim, "fine", "first", or "first-off" (first, with reasons off the point)
@@ -73,11 +72,7 @@ func (f *fakeModel) client(t *testing.T) *model.Client {
 			if f.other == "first-off" { // reasons about something else
 				reason = "rule 12 counts department heads"
 			}
-			proves := cmp.Or(f.proves, "payments.charge(o.getId());")
-			if proves == "-" {
-				proves = ""
-			}
-			reply = `{"proves":"` + proves + `","reason":"` + reason + `","right":"` + right + `"}`
+			reply = `{"reason":"` + reason + `","right":"` + right + `"}`
 		}
 		b, _ := json.Marshal(map[string]any{"message": map[string]string{"content": reply}})
 		w.Write(b)
@@ -447,25 +442,23 @@ func TestUsage(t *testing.T) {
 	}
 }
 
-// A serious finding the second look sides against stays visible as a note with the reason; one it sides with and
-// proves with a line of the code is kept; one it sides with but cannot prove becomes a note. The judge sees the code,
-// the change and the definition of a project type the claim names. No yes-or-no question is asked.
+// A serious finding the second look sides against stays visible as a note with the reason; one it sides with is
+// kept. The judge sees the code, the change and the definition of a project type the claim names, and is never asked
+// a yes-or-no question first: that question's "could not tell" used to keep a finding as an alarm unchecked.
 func TestSecondLook(t *testing.T) {
 	for _, c := range []struct {
-		other, proves, severity string
-		doubted                 bool
-		why                     string
+		other, severity string
+		doubted         bool
+		why             string
 	}{
-		{"fine", "", "low", true, "charges each order"},
-		{"", "", "medium", false, ""},
-		{"", "-", "low", true, "could not point at the line"},
-		{"", "a line that is nowhere", "low", true, "could not point at the line"},
+		{"fine", "low", true, "charges each order"},
+		{"", "medium", false, ""},
 	} {
 		tr, r, st := setup(t)
 		fm := &fakeModel{
-			reply:  `{"findings":[{"line":23,"severity":"medium","title":"Charge in a loop","evidence":"payments.charge(o.getId());","detail":"Order may be charged twice"}]}`,
-			other:  c.other,
-			proves: c.proves,
+			reply: `{"findings":[{"line":23,"severity":"medium","title":"Charge in a loop","evidence":"payments.charge(o.getId());","detail":"Order may be charged twice"}]}`,
+			judge: `{"verdict":"cannot_tell","reason":"r","proves":"","clears":""}`, // were it asked, it would keep the finding unchecked
+			other: c.other,
 		}
 		r.Model = fm.client(t)
 		if err := r.Review(context.Background(), tr.Bug, Options{}); err != nil {
@@ -478,7 +471,7 @@ func TestSecondLook(t *testing.T) {
 			}
 		}
 		if f.Severity != c.severity || (f.Doubt != "") != c.doubted || !strings.Contains(f.Doubt, c.why) {
-			t.Errorf("%q/%q: %+v", c.other, c.proves, f)
+			t.Errorf("%q: %+v", c.other, f)
 		}
 		var judged string
 		for _, p := range fm.prompts {
@@ -489,7 +482,7 @@ func TestSecondLook(t *testing.T) {
 				judged = p
 			}
 		}
-		for _, want := range []string{"Charge in a loop", "## Commit\nAdd discount", "```diff", "## Definition of Order", `"proves"`} {
+		for _, want := range []string{"Charge in a loop", "## Commit\nAdd discount", "```diff", "## Definition of Order"} {
 			if !strings.Contains(judged, want) {
 				t.Errorf("%q: choice prompt lacks %q:\n%s", c.other, want, judged)
 			}
@@ -507,21 +500,18 @@ func TestSecondLook(t *testing.T) {
 	}
 }
 
-func TestVerdictOf(t *testing.T) {
-	shown := "    public record PublicEmployee(long id,\n            String salary) {\n        payments.charge(o.getId());\n        if (!HR.equals(role)) {\n"
-	for _, c := range []struct{ verdict, proof, against, reason, want string }{
-		{"confirmed", "payments.charge(o.getId());", "", "Each order is charged inside the loop.", "confirmed"},
-		{"confirmed", "public record PublicEmployee(long id,\n String salary)", "", "A quote over two lines counts.", "confirmed"},
-		{"confirmed", "", "", "It is charged twice.", "unproven"},
-		{"confirmed", "", "payments.charge(o.getId());", "The quote is in the wrong field.", "confirmed"},   // no proof
-		{"confirmed", "The endpoint does not enforce rule 1", "", "Prose is not code.", "unproven"},         // not code
-		{"confirmed", "payments.charge(o.getId());", "", "The view might contain personal data.", "hedged"}, // a guess
-		{"refuted", "", "if (!HR.equals(role)) {", "equals on a constant is safe with null.", "refuted"},
-		{"refuted", "", "", "Both versions behave the same.", "unsure"}, // a refutation that quotes nothing changes nothing
-		{"unsure", "payments.charge(o.getId());", "", "Not settled.", "unsure"},
-	} {
-		if got := verdictOf(c.verdict, c.proof, c.against, c.reason, shown); got != c.want {
-			t.Errorf("%s / %q: got %s, want %s", c.verdict, c.reason, got, c.want)
+// A choice the model does not answer keeps the finding as it was: a failure is not a verdict either way.
+func TestFailedChoiceKeepsTheFinding(t *testing.T) {
+	tr, r, st := setup(t)
+	fm := &fakeModel{reply: `{"findings":[{"line":23,"severity":"high","title":"Charge in a loop","evidence":"payments.charge(o.getId());","detail":"d"}]}`,
+		reason: `broken"json`} // the reply cannot be read
+	r.Model = fm.client(t)
+	if err := r.Review(context.Background(), tr.Bug, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range st.Findings(tr.Bug) {
+		if f.Source == "model" && (f.Doubt != "" || f.Severity != "high") {
+			t.Errorf("a failed choice changed the finding: %+v", f)
 		}
 	}
 }
@@ -707,7 +697,7 @@ func TestTrail(t *testing.T) {
 	for _, s := range got.Steps[key] {
 		steps += s.Step + "=" + s.Result + "; "
 	}
-	for _, want := range []string{"quote=passed", "choice=sided with the claim", "proof=passed", "result=kept"} {
+	for _, want := range []string{"quote=passed", "choice=sided with the claim", "result=kept"} {
 		if !strings.Contains(steps, want) {
 			t.Errorf("steps lack %q: %s", want, steps)
 		}
