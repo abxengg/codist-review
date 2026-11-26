@@ -3,6 +3,7 @@ package review
 import (
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -65,9 +66,12 @@ var (
 	sqlNull     = regexp.MustCompile(`\bNULL\b`) // in capitals: SQL's, case matters
 	receiver    = regexp.MustCompile(`\b([A-Za-z_]\w*)\s*(?:\.\s*[A-Za-z_]\w*|\[)`)
 	removedNull = regexp.MustCompile(`(?m)^-[^-].*\bnull\b`)
-	neverNull   = regexp.MustCompile(`\.(orElseThrow|orElse|orElseGet|requireNonNull)\(|\bnew\s`)
-	thisField   = regexp.MustCompile(`\bthis\.([a-z_]\w*)\b(?:\s*[^\s(]|\s*$)`)
-	equalsArg   = regexp.MustCompile(`(equals|==|!=)\s*\(?\s*$`)
+	// A removed default: getOrDefault, orElse or requireNonNullElse taken out means a missing value now comes back as
+	// null (shop-lab: RATES.getOrDefault(state, 1800) became RATES.get(state), an int unboxed from null).
+	removedDefault = regexp.MustCompile(`(?m)^-[^-].*(\.getOrDefault\(|\.orElse(Get)?\(|requireNonNullElse(Get)?\(|defaultIfNull\()`)
+	neverNull      = regexp.MustCompile(`\.(orElseThrow|orElse|orElseGet|requireNonNull)\(|\bnew\s`)
+	thisField      = regexp.MustCompile(`\bthis\.([a-z_]\w*)\b(?:\s*[^\s(]|\s*$)`)
+	equalsArg      = regexp.MustCompile(`(equals|==|!=)\s*\(?\s*$`)
 	// A claim that only says the commit message and the code disagree. "Mismatch" alone is not that: a path separator
 	// or a type mismatch is a real problem.
 	onlyMessage = regexp.MustCompile(`(?i)commit message|message (does not|doesn't|do not) match|contradicts the (commit|message)|message mismatch|mismatch (with|between) (the )?(commit )?message`)
@@ -88,6 +92,9 @@ func judge(lines []string, patch string, line int, severity, title, evidence str
 	switch {
 	case strings.TrimSpace(evidence) == "":
 		doubt = "The model did not quote the code it means."
+	case !inFile && removedNear(patch, evidence, line, 8):
+		// The code the model quotes is what the change took out: a claim that a removed check or formula is missed.
+		// The review asks for exactly that, so the quote stands.
 	case !inFile:
 		return "quotes code that is not in the file", "", ""
 	case !near:
@@ -123,7 +130,7 @@ func nullBacked(evidence string, lines []string, line int, patch string) bool {
 	if len(names) == 0 {
 		return false
 	}
-	if removedNull.MatchString(patch) {
+	if removedNull.MatchString(patch) || removedDefault.MatchString(patch) {
 		return true
 	}
 	from, to := max(0, line-31), min(len(lines), line+30)
@@ -183,3 +190,43 @@ func lineOf(text, part string) string {
 	}
 	return text[start : i+end]
 }
+
+// removedNear says the quote is among the lines the change removed, at a place near line in the file after it.
+func removedNear(patch, quote string, line, reach int) bool {
+	want := normalise(quote)
+	if want == "" {
+		return false
+	}
+	var run strings.Builder // consecutive removed lines, so a quote spanning them still matches
+	at, n := 0, 0           // where the run sits in the new file; the new file's current line
+	check := func() bool {
+		found := run.Len() > 0 && strings.Contains(run.String(), want) && at >= line-reach && at <= line+reach
+		run.Reset()
+		return found
+	}
+	for _, l := range strings.Split(patch, "\n") {
+		switch {
+		case strings.HasPrefix(l, "@@"):
+			if check() {
+				return true
+			}
+			if m := hunkNew.FindStringSubmatch(l); m != nil {
+				n, _ = strconv.Atoi(m[1])
+			}
+		case strings.HasPrefix(l, "---"), strings.HasPrefix(l, "+++"):
+		case strings.HasPrefix(l, "-"):
+			if run.Len() == 0 {
+				at = n
+			}
+			run.WriteString(sameMarks(numbered.ReplaceAllString(l[1:], "")))
+		default:
+			if check() {
+				return true
+			}
+			n++
+		}
+	}
+	return check()
+}
+
+var hunkNew = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)`)

@@ -164,6 +164,10 @@ func (r *Reviewer) secondLook(ctx context.Context, c git.Commit, ch git.FileChan
 				got[i].Doubt = "A second look, made to choose, sided with the code: " + why
 			case "undecided":
 				got[i].Doubt = "A second look could not choose between this claim and its opposite, so it settles nothing."
+			case "split":
+				if slices.Index(severities, got[i].Severity) < slices.Index(severities, "medium") {
+					got[i].Severity = "medium"
+				}
 			}
 			if got[i].Doubt != "" {
 				got[i].Severity = "low"
@@ -246,6 +250,14 @@ func (r *Reviewer) choose(ctx context.Context, c git.Commit, ch git.FileChange, 
 		logger().Debug("second look, choice", "sha", c.Short, "path", ch.Path, "line", f.Line, "title", f.Title, "order", i, "right", out.Right, "picked", picked[i], "reason", out.Reason)
 	}
 	if picked[0] != picked[1] {
+		// Answers that follow the order, with both reasons about what the claim says: the judge argued the point
+		// and only its letter followed the order. On the three labs (2026-11-26) this demoted 3 real bugs and no
+		// finding on a clean commit, and earlier runs lost the records-lab CSV bug the same way, so the
+		// confirmation stands, at medium at most.
+		if onTopic(claim, reasons[0]) && onTopic(claim, reasons[1]) {
+			r.trail.step(f.Key, "choice", "split, kept", "Its answers followed the order, but both of its reasons spoke of the claim, so the confirmation stands.")
+			return "split", ""
+		}
 		return "undecided", ""
 	}
 	// A choice for the claim counts only when the judge's reasons speak of what the claim says. Qwen 3.5 picked

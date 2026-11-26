@@ -28,7 +28,7 @@ type fakeModel struct {
 	judge   string // the reply to a second look, when set
 	plan    string // the reply when asked which files to read, when set
 	learn   string // the reply when asked to write a check from a fix, when set
-	other   string // how the second look chooses between the claim and its opposite: "" the claim, "fine", or "first"
+	other   string // how the second look chooses between the claim and its opposite: "" the claim, "fine", "first", or "first-off" (first, with reasons off the point)
 	prompts []string
 }
 
@@ -66,8 +66,12 @@ func (f *fakeModel) client(t *testing.T) *model.Client {
 			// It stands by the claim, wherever the claim is listed, unless other says "fine" (it sides with the
 			// code) or "first" (it picks whoever is listed first).
 			claimIsA := !strings.Contains(req.Messages[1].Content, "Reviewer A says: The code after the commit is correct")
-			right := map[bool]string{true: "A", false: "B"}[claimIsA != (f.other == "fine") || f.other == "first"]
-			reply = `{"reason":"line 23 charges each order in the loop","right":"` + right + `"}`
+			right := map[bool]string{true: "A", false: "B"}[claimIsA != (f.other == "fine") || strings.HasPrefix(f.other, "first")]
+			reason := "line 23 charges each order in the loop"
+			if f.other == "first-off" { // reasons about something else
+				reason = "rule 12 counts department heads"
+			}
+			reply = `{"reason":"` + reason + `","right":"` + right + `"}`
 		}
 		b, _ := json.Marshal(map[string]any{"message": map[string]string{"content": reply}})
 		w.Write(b)
@@ -627,7 +631,9 @@ func TestRepeatedFindingsAreKeptOnce(t *testing.T) {
 // judge that picks the claim both times leaves an alarm; one that sides with the code, or with whoever is listed
 // first, leaves a note saying which.
 func TestSecondLookIsMadeToChoose(t *testing.T) {
-	for other, want := range map[string]string{"": "", "fine": "sided with the code", "first": "could not choose"} {
+	// "first": the letter follows the order but both reasons argue the claim, so it stays an alarm at medium.
+	// "first-off": the letter follows the order and the reasons are about something else: a note.
+	for other, want := range map[string]string{"": "", "fine": "sided with the code", "first": "", "first-off": "could not choose"} {
 		tr, r, st := setup(t)
 		fm := &fakeModel{reply: `{"findings":[{"line":23,"severity":"high","title":"Charges in a loop","evidence":"payments.charge(o.getId());","detail":"d"}]}`,
 			judge: `{"clears":"","proves":"payments.charge(o.getId());","reason":"Each order is charged in the loop.","verdict":"reviewer_is_right"}`, other: other}
@@ -644,6 +650,9 @@ func TestSecondLookIsMadeToChoose(t *testing.T) {
 		for _, f := range st.Findings(tr.Bug) {
 			if f.Source == "model" && (choices != 2 || (f.Doubt == "") != (want == "") || !strings.Contains(f.Doubt, want)) {
 				t.Errorf("judge chooses %q: %d choices asked, finding %+v", other, choices, f)
+			}
+			if f.Source == "model" && other == "first" && f.Severity != "medium" {
+				t.Errorf("a split choice keeps the alarm at medium, got %q", f.Severity)
 			}
 		}
 	}
