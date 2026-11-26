@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -91,11 +92,11 @@ func TestRoutesAndCalls(t *testing.T) {
 	}
 	var cs []Call
 	get("/api/activity", &cs)
-	if len(cs) == 0 || cs[0].ID != "7" || cs[0].Status != "done" || cs[0].User != "" || cs[0].PromptTokens != 10 {
+	if len(cs) == 0 || cs[0].ID != run+"-7" || cs[0].Status != "done" || cs[0].User != "" || cs[0].PromptTokens != 10 {
 		t.Fatalf("calls %+v", cs)
 	}
 	var one Call
-	get("/api/activity/7", &one)
+	get("/api/activity/"+run+"-7", &one)
 	if one.User == "" || one.Response != "{}" {
 		t.Fatalf("one call has its texts: %+v", one)
 	}
@@ -122,4 +123,33 @@ func TestRoutesAndCalls(t *testing.T) {
 		}
 	}
 	t.Fatal("the stream did not send the new line")
+}
+
+func TestKeepSavesFinishedCallsAcrossRuns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "calls.jsonl")
+	calls.list = nil
+	kept.path, kept.lines = "", 0
+	Watch()
+	Keep(path)
+	model.Observer(model.Call{ID: 1, Model: "m", User: "## Review a.java", Start: time.Now()})                          // running: not saved
+	model.Observer(model.Call{ID: 1, Model: "m", User: "## Review a.java", Start: time.Now(), Done: true, Reply: "ok"}) // finished: saved
+	model.Observer(model.Call{ID: 2, Model: "m", User: "## Fix b.java", Start: time.Now(), Done: true, Err: "boom"})
+	if len(Calls()) != 2 {
+		t.Fatalf("calls in memory: %+v", Calls())
+	}
+	// A restart: memory is empty, and the file brings the history back, prompts and replies included.
+	calls.list = nil
+	Keep(path)
+	got := Calls()
+	if len(got) != 2 || got[0].Title != "Fix b.java" || got[0].Status != "failed" || got[1].Status != "done" {
+		t.Fatalf("after a restart: %+v", got)
+	}
+	if c, ok := CallByID(got[1].ID); !ok || c.Response != "ok" || c.User == "" {
+		t.Errorf("the saved call lost its texts: %+v", c)
+	}
+	if !strings.Contains(got[0].ID, "-") {
+		t.Errorf("ids carry the run, so a new run's call 1 cannot clash with a saved call 1: %q", got[0].ID)
+	}
+	model.Observer = nil
+	calls.list, kept.path = nil, ""
 }

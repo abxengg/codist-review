@@ -321,7 +321,7 @@ var calls = struct {
 // Watch records every model call from now on, for the page.
 func Watch() {
 	model.Observer = func(c model.Call) {
-		v := Call{ID: strconv.FormatInt(c.ID, 10), At: c.Start.UnixMilli(), Kind: or(c.Label.Kind, "model"), Title: or(c.Label.Title, firstHeading(c.User)),
+		v := Call{ID: run + "-" + strconv.FormatInt(c.ID, 10), At: c.Start.UnixMilli(), Kind: or(c.Label.Kind, "model"), Title: or(c.Label.Title, firstHeading(c.User)),
 			Status: "running", Model: c.Model, SHA: c.Label.SHA, Path: c.Label.Path, System: c.System, User: c.User}
 		v.Response, v.Phase, v.FirstTokenMs = c.Reply, c.Phase, c.FirstToken.Milliseconds()
 		v.TookMs, v.PromptTokens, v.ReplyTokens = c.Usage.Took.Milliseconds(), c.Usage.PromptTokens, c.Usage.ReplyTokens
@@ -347,6 +347,9 @@ func Watch() {
 			if len(calls.list) > keepCalls {
 				calls.list = calls.list[len(calls.list)-keepCalls:]
 			}
+		}
+		if c.Done {
+			save(v)
 		}
 		calls.mu.Unlock()
 		brief := v
