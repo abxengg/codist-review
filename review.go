@@ -118,6 +118,7 @@ func (r *Reviewer) Review(ctx context.Context, sha string, opt Options) error {
 		}
 		if !lang.IsTest(c.Path) {
 			findings = append(findings, r.specNumbers(sha, c, f)...)
+			findings = append(findings, r.removedTransactions(sha, c, f)...)
 			findings = append(findings, r.learnedFindings(sha, c.Path, f, changed)...)
 		}
 		targets = append(targets, target{c, f})
