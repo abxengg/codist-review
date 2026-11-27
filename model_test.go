@@ -745,3 +745,38 @@ func TestNextOlder(t *testing.T) {
 		t.Errorf("a commit the model could not read is left alone: %s", got)
 	}
 }
+
+// A baseline issue whose bug is a deleted line is dated to the commit that deleted it, not to the commit blame names
+// for the reported line (codist-review#9, shop-lab "The URL's customerId is never used").
+func TestBaselineDatesADeletedLine(t *testing.T) {
+	tr, r, st := setup(t)
+	const path = "order-service/src/main/java/com/shop/order/CustomerOrders.java"
+	method := func(body string) string {
+		return "package com.shop.order;\n\nimport java.util.List;\n\n@RestController\npublic class CustomerOrders {\n" +
+			"    private final OrderRepository orders;\n\n    CustomerOrders(OrderRepository orders) {\n        this.orders = orders;\n    }\n\n" +
+			"    @GetMapping(\"/customers/{customerId}/orders\")\n    public List<Order> list(@PathVariable long customerId) {\n" + body + "    }\n}\n"
+	}
+	tr.Commit("Let customers see their orders", map[string]string{path: method("        return orders.all().stream()\n            .filter(o -> o.customerId() == customerId)\n            .toList();\n")})
+	written := tr.Head()
+	tr.Commit("Simplify the order lookup", map[string]string{path: method("        return orders.all().stream()\n            .toList();\n")})
+	broke := tr.Head()
+	tr.Commit("Unrelated", map[string]string{"README.md": "x\n"})
+	src, _ := testrepo.Sources()
+	head, _ := r.Repo.FileAt("HEAD", path)
+	src[path] = head
+	if _, err := r.Baseline(src); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, is := range st.AllIssues() {
+		if is.Path == path && is.Latest.Rule == "unused-path-variable" {
+			found = true
+			if is.FirstSHA != broke {
+				t.Errorf("dated to %s, want the commit that removed the filter %s (the method was written in %s)", is.FirstSHA, broke, written)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("the unused path variable was not reported")
+	}
+}

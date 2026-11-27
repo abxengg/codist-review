@@ -660,7 +660,7 @@ func (r *Reviewer) Baseline(files map[string][]byte) (int, error) {
 			}
 			// A line not committed yet is blamed on a commit of all zeros: it has no first commit.
 			if is.Line >= 1 && is.Line <= len(blame) && strings.Trim(blame[is.Line-1], "0") != "" {
-				fd.FirstSHA = blame[is.Line-1]
+				fd.FirstSHA = r.firstSeen(x.lang, path, facts[x.lang], is, blame[is.Line-1])
 			}
 			findings = append(findings, fd)
 		}
@@ -673,6 +673,39 @@ func (r *Reviewer) Baseline(files map[string][]byte) (int, error) {
 		return 0, err
 	}
 	return len(findings), r.Store.SetReview(store.Review{SHA: BaselineSHA, Status: "done", Note: "Checked the whole code on first run.", Started: started, Finished: time.Now()})
+}
+
+// firstSeen is the commit that brought a baseline issue. Blame names the commit that last changed the reported line,
+// which is wrong when the bug is a line taken away elsewhere: shop-lab's "The URL's customerId is never used" was
+// blamed on the commit that wrote the method, though a later one removed the filter that used customerId. The checks
+// are exact and take milliseconds, so the issue is checked at the blamed commit and, when it is not there yet, at each
+// later commit that changed the file, oldest first, up to 50; the first where it appears brought it.
+func (r *Reviewer) firstSeen(lang Language, path string, facts any, is Issue, blamed string) string {
+	holds := func(sha string) bool {
+		src, ok := r.Repo.FileAt(sha, path)
+		if !ok {
+			return false
+		}
+		for _, x := range lang.Check(lang.Parse(path, src), nil, facts) {
+			if x.Rule == is.Rule && x.Title == is.Title {
+				return true
+			}
+		}
+		return false
+	}
+	if holds(blamed) {
+		return blamed
+	}
+	later := r.Repo.Later(blamed, path)
+	for i, sha := range later {
+		if i == 50 {
+			break
+		}
+		if holds(sha) {
+			return sha
+		}
+	}
+	return blamed
 }
 
 func plural1(n int) string {
