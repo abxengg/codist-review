@@ -3,19 +3,30 @@
 How [Codist](https://github.com/abxengg/codist) reviews a commit, and where it keeps the results.
 
 - **Review** runs the exact code checks on every changed line, then asks the local model about the changed files.
-  Each model claim must quote the code it means; a quote that is not there is dropped, and a claim the code does not
-  back (a null warning with nothing that makes the value null, say) is shown as a note rather than stated as fact.
+  Each model claim must quote the code it means, as it is after the change or among the lines the change removed; a
+  quote that is in neither is dropped, and a claim the code does not back (a null warning with nothing that makes the
+  value null, say) is shown as a note rather than stated as fact. A removed `getOrDefault` or `orElse` counts as
+  what makes a value null.
 - **Exact facts before a second opinion:** a model claim the code contradicts becomes a note with the reason, before
   any second look: "strings compared with ==" on a line where Codist's type-aware check finds no string comparison,
   or "not implemented" when another file of the same commit does it. The model also sees the commit's other changes,
   so it stops calling things missing that the commit adds elsewhere. A serious claim that survives is checked once
-  more by a second look, and stays an alarm only when the model quotes code that proves it.
+  more by a second look.
 - **Issues** are followed across commits by a key made of the rule or title, the file and the flagged line, so an
   issue is reported once and closed by the commit that fixes it. An issue whose first commit was amended, rebased or
   reset away can still be closed by a later fix, and an open issue moves with its file when the file is renamed.
   Catching up newest first, an issue found in an old commit that a later commit already fixed is closed at once.
-- **Second look and forced choice:** a serious model claim is put to the model again with the code before and after;
-  it must quote the line that proves it, then pick between the claim and its opposite twice, in both orders.
+- **Second look, a choice in both orders:** a serious model claim is put to the model again with the code before and
+  after, the definitions of the types it names and the team's rules, as two reviewers: one with the claim, one saying
+  the code is fine. The model picks the right one twice, with the two in swapped order, because models tend to pick
+  by position. Picked both times, the claim stays an alarm; the code picked both times, or reasons about something
+  else, make it a note with the reason. When the answers follow the order but both reasons are about the claim, it
+  stays an alarm at medium for a person to judge. A failed call leaves the finding as it was. There is no yes-or-no
+  question first: it said yes 45 times in 49, and its "could not tell" let claims through unchecked. On the three
+  labs this took v0.12.0 from 54 to 60 of 62 planted bugs, with 1 of 14 clean commits alarmed instead of 2
+  ([abxengg/codist#19](https://github.com/abxengg/codist/issues/19)).
+- **Second reading:** `Options.Twice` reads each file again and keeps what only the second reading finds; Codist
+  sets it for commits its risk model rates high, or for all with `twice = true`.
 - **Reading plan:** above `MaxFiles` changed files, the model first says which files need reading and why; a person
   can ask for a skipped file (`Options.Force`).
 - **Idle time:** `NextIdle` picks what an idle model lane reads: a recent commit through the specialist lenses
